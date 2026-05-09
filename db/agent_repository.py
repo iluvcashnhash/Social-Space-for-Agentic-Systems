@@ -121,6 +121,12 @@ class AgentStateRepository:
             existing.tick = state.tick
             existing.payload = payload
 
+    def list_all(self) -> list[AgentState]:
+        """Return every persisted agent, re-validated through the Pydantic schema."""
+        with self._transaction() as session:
+            rows = session.execute(select(AgentStateRecord)).scalars().all()
+            return [AgentState.model_validate(r.payload) for r in rows]
+
     def load(self, agent_id: UUID) -> AgentState:
         """Load and re-validate an agent state from the database."""
         with self._transaction() as session:
