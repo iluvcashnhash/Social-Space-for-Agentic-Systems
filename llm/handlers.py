@@ -389,10 +389,18 @@ class LLMPhaseCoordinator:
                     or "rate_limit" in exc_str.lower()
                     or "rate limit" in exc_str.lower()
                 )
+                is_quota_exhausted = (
+                    "insufficient_quota" in exc_str.lower()
+                    or "billing" in exc_str.lower()
+                    or "credits" in exc_str.lower()
+                    or "exceeded your current quota" in exc_str.lower()
+                )
                 is_parse_or_schema = isinstance(
                     exc, (json.JSONDecodeError, ValidationError, ValueError)
                 )
-                if not (is_parse_or_schema or is_rate_limit):
+                # Treat quota/billing errors as retriable with long backoff
+                # (they may resolve when user adds credits)
+                if not (is_parse_or_schema or is_rate_limit or is_quota_exhausted):
                     raise
 
                 last_exc = exc
