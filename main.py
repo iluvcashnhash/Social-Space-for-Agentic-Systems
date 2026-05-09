@@ -534,7 +534,10 @@ class SimulationRunner:
         self._shutdown = asyncio.Event()
         self._worlds: Dict[str, WorldRuntime] = {}
         # ONE shared semaphore across all worlds: prevents 3x TPM burst.
-        self._llm_semaphore = asyncio.Semaphore(max_concurrent_agents)
+        # Reduce concurrency to avoid OpenAI rate limits (429 errors).
+        # gpt-4o-mini free tier: 20 RPM limit
+        effective_concurrency = min(max_concurrent_agents, 3)
+        self._llm_semaphore = asyncio.Semaphore(effective_concurrency)
         # Set during setup() — reused for the compliance phase.
         self._coord: Optional[LLMPhaseCoordinator] = None
 
@@ -578,7 +581,7 @@ class SimulationRunner:
 
         coord = LLMPhaseCoordinator(
             client=make_llm_client(),
-            retry=RetryConfig(max_attempts=6, base_delay=1.0, max_delay=30.0, jitter=0.3),
+            retry=RetryConfig(max_attempts=6, base_delay=2.0, max_delay=60.0, jitter=0.3),
         )
         self._coord = coord
 
