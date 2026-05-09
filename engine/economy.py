@@ -53,7 +53,12 @@ class EconomyConfig:
     # Robotization
     critical_labor_ratio: float = 0.20        # T_w / T_w_potential floor
     automation_fill_factor: float = 1.0       # fraction of demand auto-supplied
-    automation_min_supply: float = 1.0        # absolute floor per good when triggered
+    automation_min_supply: float = 5.0        # absolute floor per good when triggered
+
+    # Defensive damping for long-horizon stability
+    tax_base_smoothing: float = 0.3           # EMA factor for transaction volume (0 = no smoothing, 1 = full smoothing)
+    eta_damping_enabled: bool = True          # reduce price responsiveness during monetary emission
+    eta_damping_coefficient: float = 0.5      # how aggressively to dampen (0.5 = reduce eta by 50% at max deficit)
 
     def __post_init__(self) -> None:
         if self.ubi_coverage_ratio < 1.0:
@@ -64,6 +69,8 @@ class EconomyConfig:
             raise ValueError("beta must be positive")
         if not (0.0 < self.critical_labor_ratio < 1.0):
             raise ValueError("critical_labor_ratio must be in (0, 1)")
+        if not (0.0 <= self.tax_base_smoothing <= 1.0):
+            raise ValueError("tax_base_smoothing must be in [0, 1]")
 
 
 @dataclass(frozen=True)
@@ -299,6 +306,7 @@ def run_economic_tick(
     aggregate_labor_hours: float,
     potential_labor_hours: float,
     eta: Mapping[str, float] | None = None,
+    smoothed_transaction_volume: float | None = None,  # EMA of volume for tax base
     config: EconomyConfig = EconomyConfig(),
 ) -> MarketState:
     """
@@ -309,10 +317,21 @@ def run_economic_tick(
     1. Robotization is evaluated *first* on the previous-tick supply, so that
        the price update sees the supply that will actually be available.
     2. Walrasian price update is computed against the (possibly augmented)
-       supply.
-    3. Fiscal block is independent and runs on the previous-tick transaction
-       volume.
+       supply, with optional eta damping during high monetary emission.
+    3. Fiscal block is independent and runs on the (possibly smoothed)
+       previous-tick transaction volume.
+
+    Defensive mechanisms (100-tick horizon):
+    * EMA smoothing of tax base prevents whipsaw from volatile transaction volumes.
+    * Eta damping reduces price volatility when emission_deficit is high.
     """
+    # Apply EMA smoothing to transaction volume if provided
+    effective_volume = previous_transaction_volume
+    if smoothed_transaction_volume is not None and config.tax_base_smoothing > 0:
+        alpha = config.tax_base_smoothing
+        effective_volume = alpha * smoothed_transaction_volume + (1 - alpha) * previous_transaction_volume
+        effective_volume = max(0.0, effective_volume)  # floor at zero
+
     augmented_supply, triggered, contribution = endogenous_robotization(
         aggregate_labor_hours=aggregate_labor_hours,
         potential_labor_hours=potential_labor_hours,
@@ -321,18 +340,32 @@ def run_economic_tick(
         config=config,
     )
 
+    # Compute fiscal block first (needed for eta damping)
+    fiscal = calculate_ubi_and_taxes(
+        survival_cost=survival_cost,
+        n_agents=n_agents,
+        previous_transaction_volume=effective_volume,
+        config=config,
+    )
+
+    # Dynamic eta damping: reduce price responsiveness during high emission
+    dampened_eta = eta
+    if config.eta_damping_enabled and fiscal.required_budget > 0:
+        deficit_ratio = fiscal.emission_deficit / fiscal.required_budget
+        if deficit_ratio > 0:
+            damping_factor = 1.0 - config.eta_damping_coefficient * deficit_ratio
+            damping_factor = max(0.1, damping_factor)  # floor at 10% to prevent freeze
+            if eta is not None:
+                dampened_eta = {good: eta_val * damping_factor for good, eta_val in eta.items()}
+            else:
+                # Create dampened eta dict with default_eta scaled
+                dampened_eta = {good: config.default_eta * damping_factor for good in prices.keys()}
+
     price_update = walrasian_price_update(
         prices=prices,
         demand=demand,
         supply=augmented_supply,
-        eta=eta,
-        config=config,
-    )
-
-    fiscal = calculate_ubi_and_taxes(
-        survival_cost=survival_cost,
-        n_agents=n_agents,
-        previous_transaction_volume=previous_transaction_volume,
+        eta=dampened_eta,
         config=config,
     )
 

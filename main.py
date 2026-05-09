@@ -99,6 +99,7 @@ class WorldState:
     prices: Dict[str, float] = field(default_factory=lambda: {g: 1.0 for g in GOODS})
     supply: Dict[str, float] = field(default_factory=lambda: {g: 100.0 for g in GOODS})
     last_transaction_volume: float = 0.0
+    smoothed_transaction_volume: float = 0.0  # EMA for tax base stability
     last_aggregate_labor_hours: float = 0.0
     feed: List[Content] = field(default_factory=list)
     last_market: Optional[MarketState] = None
@@ -636,6 +637,7 @@ class SimulationRunner:
             supply=state.supply,
             aggregate_labor_hours=state.last_aggregate_labor_hours,
             potential_labor_hours=24.0 * len(agents),
+            smoothed_transaction_volume=state.smoothed_transaction_volume if state.smoothed_transaction_volume > 0 else None,
             config=cfg.economy,
         )
         state.prices = dict(market.prices.new_prices)
@@ -692,6 +694,15 @@ class SimulationRunner:
 
         state.last_transaction_volume = total_spending
         state.last_aggregate_labor_hours = _aggregate_labor(agents)
+
+        # Update EMA of transaction volume for next tick's tax base smoothing
+        if state.smoothed_transaction_volume == 0.0:
+            state.smoothed_transaction_volume = total_spending
+        else:
+            alpha = cfg.economy.tax_base_smoothing
+            state.smoothed_transaction_volume = (
+                alpha * state.smoothed_transaction_volume + (1 - alpha) * total_spending
+            )
 
         # F. Macro-event pass (Social Credit Protocol etc.). Conditional and
         # NOT part of the strict phase graph; runs only if the scheduler fires
