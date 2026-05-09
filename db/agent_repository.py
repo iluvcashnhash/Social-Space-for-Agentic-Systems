@@ -44,11 +44,19 @@ class Base(DeclarativeBase):
 
 
 class AgentStateRecord(Base):
-    """ORM row backing a single agent's most recent state snapshot."""
+    """ORM row backing a single agent's most recent state snapshot.
+
+    The composite primary key ``(agent_id, world_id)`` lets us host the same
+    logical agent in multiple isolated experimental worlds (alpha / beta /
+    gamma) without collisions: each world owns its own row per agent.
+    """
 
     __tablename__ = "agent_states"
 
     agent_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    world_id: Mapped[str] = mapped_column(
+        String(16), primary_key=True, default="alpha", nullable=False
+    )
     core_identity_prompt: Mapped[str] = mapped_column(Text, nullable=False)
     tick: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     payload: Mapped[dict] = mapped_column(JSON, nullable=False)
@@ -92,13 +100,15 @@ class AgentStateRepository:
         """
         payload = state.model_dump(mode="json")
         agent_id_str = str(state.agent_id)
+        world_id_str = state.world_id
 
         with self._transaction() as session:
             # FOR UPDATE is a no-op on SQLite (not supported); on PostgreSQL it
             # provides a pessimistic row lock to prevent concurrent write races.
             is_pg = session.bind.dialect.name == "postgresql"  # type: ignore[union-attr]
             stmt = select(AgentStateRecord).where(
-                AgentStateRecord.agent_id == agent_id_str
+                AgentStateRecord.agent_id == agent_id_str,
+                AgentStateRecord.world_id == world_id_str,
             )
             if is_pg:
                 stmt = stmt.with_for_update()
@@ -108,6 +118,7 @@ class AgentStateRepository:
                 session.add(
                     AgentStateRecord(
                         agent_id=agent_id_str,
+                        world_id=world_id_str,
                         core_identity_prompt=state.core_identity_prompt,
                         tick=state.tick,
                         payload=payload,
@@ -118,26 +129,36 @@ class AgentStateRepository:
             # Identity invariant: refuse to mutate the Cathedral anchor.
             if existing.core_identity_prompt != state.core_identity_prompt:
                 raise ValueError(
-                    f"Refusing to overwrite core_identity_prompt for agent {state.agent_id}: "
-                    "identity drift detected."
+                    f"Refusing to overwrite core_identity_prompt for agent "
+                    f"{state.agent_id} in world {world_id_str!r}: identity drift detected."
                 )
 
             existing.tick = state.tick
             existing.payload = payload
 
-    def list_all(self) -> list[AgentState]:
-        """Return every persisted agent, re-validated through the Pydantic schema."""
+    def list_all(self, world_id: Optional[str] = None) -> list[AgentState]:
+        """Return persisted agents (optionally filtered by ``world_id``).
+
+        Passing ``None`` returns every agent in every world — useful for global
+        bookkeeping; the simulation runner always filters by a specific world.
+        """
         with self._transaction() as session:
-            rows = session.execute(select(AgentStateRecord)).scalars().all()
+            stmt = select(AgentStateRecord)
+            if world_id is not None:
+                stmt = stmt.where(AgentStateRecord.world_id == world_id)
+            rows = session.execute(stmt).scalars().all()
             return [AgentState.model_validate(r.payload) for r in rows]  # type: ignore[arg-type]
 
-    def load(self, agent_id: UUID) -> AgentState:
+    def load(self, agent_id: UUID, world_id: str = "alpha") -> AgentState:
         """Load and re-validate an agent state from the database."""
         with self._transaction() as session:
             stmt = select(AgentStateRecord).where(
-                AgentStateRecord.agent_id == str(agent_id)
+                AgentStateRecord.agent_id == str(agent_id),
+                AgentStateRecord.world_id == world_id,
             )
             row = session.execute(stmt).scalar_one_or_none()
             if row is None:
-                raise NoResultFound(f"No AgentState for agent_id={agent_id}")
+                raise NoResultFound(
+                    f"No AgentState for agent_id={agent_id} in world={world_id!r}"
+                )
             return AgentState.model_validate(row.payload)  # type: ignore[arg-type]

@@ -57,7 +57,16 @@ class ScoredContent:
 
 @dataclass(frozen=True)
 class FeedConfig:
-    """Tuning parameters for the algorithmic feed."""
+    """Tuning parameters for the algorithmic feed.
+
+    The ``ranking_enabled`` flag is the experimental treatment switch:
+    when ``False`` (Alpha & Beta worlds) the runner serves content in random
+    order with no echo-chamber amplification, isolating the causal effect of
+    algorithmic curation in the Gamma world.
+    """
+
+    # Treatment switch
+    ranking_enabled: bool = True
 
     # Score component weights
     w_similarity: float = 0.4

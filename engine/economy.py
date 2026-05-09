@@ -41,6 +41,7 @@ class EconomyConfig:
     """Static, tick-invariant parameters of the economy."""
 
     # Fiscal
+    ubi_enabled: bool = True                  # if False -> no transfers (Alpha world)
     ubi_coverage_ratio: float = 1.10          # UBI = 110% of survival cost
     max_tax_rate: float = 0.60                # hard cap on flat transaction tax
 
@@ -127,6 +128,17 @@ def calculate_ubi_and_taxes(
         raise ValueError("n_agents must be positive")
     if previous_transaction_volume < 0:
         raise ValueError("previous_transaction_volume must be non-negative")
+
+    # Control world (Alpha): UBI disabled -> pure market subsistence economy.
+    if not config.ubi_enabled:
+        return FiscalReport(
+            ubi_per_agent=0.0,
+            required_budget=0.0,
+            applied_tax_rate=0.0,
+            tax_revenue=0.0,
+            emission_deficit=0.0,
+            n_agents=n_agents,
+        )
 
     ubi_per_agent = config.ubi_coverage_ratio * survival_cost
     required_budget = ubi_per_agent * n_agents

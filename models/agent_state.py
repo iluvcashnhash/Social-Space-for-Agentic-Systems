@@ -192,6 +192,18 @@ class AgentState(BaseModel):
         frozen=True,
         description="Stable, immutable agent identifier.",
     )
+    world_id: str = Field(
+        default="alpha",
+        frozen=True,
+        min_length=1,
+        max_length=16,
+        description=(
+            "Isolated experimental world the agent lives in. The same logical "
+            "agent (identical agent_id) can be cloned into multiple worlds with "
+            "different EconomyConfig/FeedConfig to support causal A/B/C designs "
+            "(Control / Isolated shock / Compound shock)."
+        ),
+    )
     core_identity_prompt: str = Field(
         ...,
         frozen=True,

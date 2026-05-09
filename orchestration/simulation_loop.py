@@ -232,6 +232,7 @@ class TickMetrics(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    world_id: str = Field(default="alpha", min_length=1, max_length=16)
     tick: int = Field(..., ge=0)
     timestamp: datetime
     prices: Dict[str, float]
@@ -268,7 +269,8 @@ class MetricsLogger:
         else:
             self._buffer.append(metrics)
         logger.info(
-            "tick=%d burnout_rate=%.3f auth=%.3f spectacle=%.3f deficit=%.2f",
+            "world=%s tick=%d burnout_rate=%.3f auth=%.3f spectacle=%.3f deficit=%.2f",
+            metrics.world_id,
             metrics.tick,
             metrics.burnout_rate,
             metrics.mean_authenticity_index,
@@ -325,6 +327,8 @@ class SimulationLoop:
         metrics_logger: MetricsLogger,
         bus: Optional[Any] = None,
         max_concurrent_agents: int = 10,
+        semaphore: Optional[asyncio.Semaphore] = None,
+        world_id: str = "alpha",
     ) -> None:
         missing = set(_PHASE_SCHEMA) - set(handlers)
         if missing:
@@ -332,7 +336,11 @@ class SimulationLoop:
         self._handlers = dict(handlers)
         self._metrics = metrics_logger
         self._bus = bus if bus is not None else self._default_bus()
-        self._semaphore = asyncio.Semaphore(max_concurrent_agents)
+        # When multiple SimulationLoop instances share an external semaphore
+        # (one per experimental world) the LLM rate-limit budget is enforced
+        # globally — preventing a 3x token-per-minute burst on the API.
+        self._semaphore = semaphore or asyncio.Semaphore(max_concurrent_agents)
+        self._world_id = world_id
 
     @staticmethod
     def _default_bus() -> Any:
@@ -437,6 +445,7 @@ class SimulationLoop:
                 per_agent=per_agent,
                 automation_triggered=automation_triggered,
                 emission_deficit=emission_deficit,
+                world_id=self._world_id,
             )
         )
         return per_agent
@@ -453,6 +462,7 @@ class SimulationLoop:
         per_agent: Mapping[UUID, Dict[Phase, PhaseResult]],
         automation_triggered: bool,
         emission_deficit: float,
+        world_id: str = "alpha",
     ) -> TickMetrics:
         n = max(1, len(agents))
         agg_time: Dict[str, float] = {slot: 0.0 for slot in REQUIRED_TIME_SLOTS}
@@ -469,6 +479,7 @@ class SimulationLoop:
 
         mean_time = {slot: total / n for slot, total in agg_time.items()}
         return TickMetrics(
+            world_id=world_id,
             tick=tick,
             timestamp=datetime.now(timezone.utc),
             prices=dict(prices),

@@ -42,8 +42,9 @@ try:
 except ImportError:
     pass
 
+import random
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from uuid import UUID
 
 from sqlalchemy import create_engine
@@ -127,12 +128,10 @@ class StubLLMClient:
         if schema_name == "EconomicDecision":
             return json.dumps(
                 {
-                    "time_allocation": {
-                        "labor": 8.0,
-                        "creation": 4.0,
-                        "spectacle": 4.0,
-                        "rest": 8.0,
-                    },
+                    "labor": 8.0,
+                    "creation": 4.0,
+                    "spectacle": 4.0,
+                    "rest": 8.0,
                     "spending": 25.0,
                     "savings": 5.0,
                 }
@@ -307,15 +306,17 @@ def _per_agent_context(
     market: MarketState,
     feed: Sequence[Content],
     feed_config: FeedConfig,
+    rng: Optional[random.Random] = None,
 ) -> Dict[str, Any]:
-    ranked = rank_feed(
-        agent=agent,
-        contents=feed,
-        cf_terms={c.content_id: 0.5 for c in feed},  # neutral CF prior
-        config=feed_config,
-    )
-    return {
-        "feed": [
+    if feed_config.ranking_enabled:
+        # Gamma world: full algorithmic curation (similarity + spectacle + CF).
+        ranked = rank_feed(
+            agent=agent,
+            contents=feed,
+            cf_terms={c.content_id: 0.5 for c in feed},  # neutral CF prior
+            config=feed_config,
+        )
+        feed_payload = [
             {
                 "content_id": s.content.content_id,
                 "score": s.score,
@@ -323,7 +324,23 @@ def _per_agent_context(
                 "similarity": s.similarity,
             }
             for s in ranked[:10]
-        ],
+        ]
+    else:
+        # Alpha & Beta worlds: random shuffling, no echo-chamber amplification.
+        order = list(feed)
+        if rng is not None:
+            rng.shuffle(order)
+        feed_payload = [
+            {
+                "content_id": c.content_id,
+                "score": 0.0,
+                "spectacle_value": c.spectacle_value,
+                "similarity": 0.0,
+            }
+            for c in order[:10]
+        ]
+    return {
+        "feed": feed_payload,
         "available_attention": 1.0,
         "prices": dict(market.prices.new_prices),
         "ubi_per_agent": market.fiscal.ubi_per_agent,
@@ -397,6 +414,7 @@ def _apply_phase_outputs(
     new_agent = AgentState.model_validate(
         {
             "agent_id": agent.agent_id,
+            "world_id": agent.world_id,
             "core_identity_prompt": agent.core_identity_prompt,
             "ideology": agent.ideology.model_dump(),
             "cognition": new_cognition.model_dump(),
@@ -412,7 +430,65 @@ def _apply_phase_outputs(
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Per-world configuration (Alpha / Beta / Gamma experimental conditions)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class WorldConfig:
+    """Static experimental treatment for one isolated world."""
+
+    world_id: str
+    economy: EconomyConfig
+    feed: FeedConfig
+    description: str
+
+
+# 2x2 design (minus one redundant cell): UBI ∈ {off, on} × Algo ∈ {off, on}.
+WORLD_CONFIGS: Tuple[WorldConfig, ...] = (
+    WorldConfig(
+        world_id="alpha",
+        economy=EconomyConfig(ubi_enabled=False),
+        feed=FeedConfig(ranking_enabled=False),
+        description="Control: market subsistence, random feed.",
+    ),
+    WorldConfig(
+        world_id="beta",
+        economy=EconomyConfig(ubi_enabled=True),
+        feed=FeedConfig(ranking_enabled=False),
+        description="Isolated UBI shock: UBI on, random feed.",
+    ),
+    WorldConfig(
+        world_id="gamma",
+        economy=EconomyConfig(ubi_enabled=True),
+        feed=FeedConfig(ranking_enabled=True),
+        description="Compound shock: UBI + algorithmic curation.",
+    ),
+)
+
+
+@dataclass
+class WorldRuntime:
+    """Per-world mutable runtime container (state + metrics + tick loop)."""
+
+    config: WorldConfig
+    state: WorldState
+    metrics: MetricsLogger
+    loop: SimulationLoop
+    seed_feed: List[Content]
+    rng: random.Random
+
+
 class SimulationRunner:
+    """Orchestrates parallel-but-isolated runs of N experimental worlds.
+
+    Each tick is processed sequentially across worlds (alpha → beta → gamma)
+    so they share a single global LLM rate-limit budget; nothing crosses
+    between worlds — every macro-state, feed, and metrics buffer is owned by
+    the corresponding ``WorldRuntime``.
+    """
+
     def __init__(
         self,
         *,
@@ -420,23 +496,21 @@ class SimulationRunner:
         max_ticks: int,
         n_agents: int,
         seed: int,
-        economy_config: EconomyConfig = EconomyConfig(),
-        feed_config: FeedConfig = FeedConfig(),
+        world_configs: Sequence[WorldConfig] = WORLD_CONFIGS,
+        max_concurrent_agents: int = 10,
     ) -> None:
         self._db_url = db_url
         self._max_ticks = max_ticks
         self._n_agents = n_agents
         self._seed = seed
-        self._economy = economy_config
-        self._feed_config = feed_config
+        self._world_configs = tuple(world_configs)
 
         self._engine = create_engine(db_url, future=True)
         self._repo = AgentStateRepository(self._engine)
-        self._metrics = MetricsLogger()
-        self._world = WorldState()
-        self._seed_feed: List[Content] = []
         self._shutdown = asyncio.Event()
-        self._loop: Optional[SimulationLoop] = None
+        self._worlds: Dict[str, WorldRuntime] = {}
+        # ONE shared semaphore across all worlds: prevents 3x TPM burst.
+        self._llm_semaphore = asyncio.Semaphore(max_concurrent_agents)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -448,82 +522,117 @@ class SimulationRunner:
 
     async def setup(self) -> None:
         Base.metadata.create_all(self._engine)
+        world_ids = tuple(wc.world_id for wc in self._world_configs)
         existing = self._repo.list_all()
         if not existing:
-            logger.info("Empty DB — bootstrapping silicon sample (n=%d).", self._n_agents)
+            logger.info(
+                "Empty DB — bootstrapping silicon sample (n=%d) into worlds %s.",
+                self._n_agents, world_ids,
+            )
             _agents, feed = bootstrap(
                 db_url=self._db_url,
                 n_agents=self._n_agents,
                 seed=self._seed,
+                world_ids=world_ids,
             )
-            self._seed_feed = list(feed)
+            seed_feed = list(feed)
         else:
-            logger.info("Found %d existing agents — resuming.", len(existing))
-            self._seed_feed = generate_seed_content(seed=self._seed)
-
-        self._world.feed = list(self._seed_feed)
+            per_world_counts = {
+                wid: len(self._repo.list_all(world_id=wid)) for wid in world_ids
+            }
+            missing = [wid for wid, n in per_world_counts.items() if n == 0]
+            if missing:
+                raise RuntimeError(
+                    f"Worlds {missing} are empty but DB is non-empty for others "
+                    f"({per_world_counts}). Delete the DB to re-bootstrap or "
+                    "supply a matching set of world_ids."
+                )
+            logger.info("Resuming with worlds %s: %s", world_ids, per_world_counts)
+            seed_feed = generate_seed_content(seed=self._seed)
 
         coord = LLMPhaseCoordinator(
             client=make_llm_client(),
             retry=RetryConfig(max_attempts=6, base_delay=1.0, max_delay=30.0, jitter=0.3),
         )
-        self._loop = SimulationLoop(
-            handlers={
-                Phase.CONSUMPTION: coord.handle_consumption,
-                Phase.ECONOMIC_DECISION: coord.handle_economic_decision,
-                Phase.REFLECTION: coord.handle_reflection,
-            },
-            metrics_logger=self._metrics,
-        )
+
+        for cfg in self._world_configs:
+            metrics = MetricsLogger()
+            loop = SimulationLoop(
+                handlers={
+                    Phase.CONSUMPTION: coord.handle_consumption,
+                    Phase.ECONOMIC_DECISION: coord.handle_economic_decision,
+                    Phase.REFLECTION: coord.handle_reflection,
+                },
+                metrics_logger=metrics,
+                semaphore=self._llm_semaphore,    # shared across worlds
+                world_id=cfg.world_id,
+            )
+            world_state = WorldState(feed=list(seed_feed))
+            # Per-world deterministic RNG (different streams per world but
+            # reproducible across runs given the same master seed).
+            rng = random.Random(hash((self._seed, cfg.world_id)) & 0xFFFFFFFF)
+            self._worlds[cfg.world_id] = WorldRuntime(
+                config=cfg,
+                state=world_state,
+                metrics=metrics,
+                loop=loop,
+                seed_feed=list(seed_feed),
+                rng=rng,
+            )
 
     # ------------------------------------------------------------------
-    # Single tick
+    # Single tick — one world
     # ------------------------------------------------------------------
-    async def _run_one_tick(self, tick: int) -> None:
-        assert self._loop is not None
+    async def _run_world_tick(self, world: WorldRuntime, tick: int) -> None:
+        cfg = world.config
+        state = world.state
 
-        # A. Load all agents from the DB (re-validated by Pydantic on the way in).
-        agents = self._repo.list_all()
+        # A. Load this world's agents only.
+        agents = self._repo.list_all(world_id=cfg.world_id)
         if not agents:
-            raise RuntimeError("No agents in DB; cannot run a tick.")
+            raise RuntimeError(f"World {cfg.world_id!r} has no agents at tick {tick}.")
 
-        # B. Macro-economy on previous-tick aggregates.
-        demand = _aggregate_demand(self._world.last_transaction_volume, self._world.prices)
+        # B. Macro-economy on this world's previous-tick aggregates.
+        demand = _aggregate_demand(state.last_transaction_volume, state.prices)
         market = run_economic_tick(
             survival_cost=sum(a.economics.survival_cost for a in agents) / len(agents),
             n_agents=len(agents),
-            previous_transaction_volume=self._world.last_transaction_volume,
-            prices=self._world.prices,
+            previous_transaction_volume=state.last_transaction_volume,
+            prices=state.prices,
             demand=demand,
-            supply=self._world.supply,
-            aggregate_labor_hours=self._world.last_aggregate_labor_hours,
+            supply=state.supply,
+            aggregate_labor_hours=state.last_aggregate_labor_hours,
             potential_labor_hours=24.0 * len(agents),
-            config=self._economy,
+            config=cfg.economy,
         )
-        self._world.prices = dict(market.prices.new_prices)
-        self._world.supply = dict(market.supply)
-        self._world.last_market = market
+        state.prices = dict(market.prices.new_prices)
+        state.supply = dict(market.supply)
+        state.last_market = market
 
-        # C. Refresh the algorithmic feed from agents' creation outputs.
-        self._world.feed = _synthesise_feed(agents, self._seed_feed)
+        # C. Refresh feed from this world's agents' creation outputs.
+        state.feed = _synthesise_feed(agents, world.seed_feed)
 
-        # D. Parallel micro-level tick across the population.
+        # D. Micro-level tick across THIS world's population only.
         contexts = {
             a.agent_id: _per_agent_context(
-                a, market=market, feed=self._world.feed, feed_config=self._feed_config
+                a,
+                market=market,
+                feed=state.feed,
+                feed_config=cfg.feed,
+                rng=world.rng,
             )
             for a in agents
         }
-        per_agent: Dict[UUID, Dict[Phase, PhaseResult]] = await self._loop.run_tick(
+        per_agent: Dict[UUID, Dict[Phase, PhaseResult]] = await world.loop.run_tick(
             agents,
             tick=tick,
-            prices=self._world.prices,
+            prices=state.prices,
             automation_triggered=market.automation_triggered,
             emission_deficit=market.fiscal.emission_deficit,
             contexts=contexts,
         )
 
-        # E. Apply phase outputs and persist transactionally.
+        # E. Apply phase outputs and persist (each save uses world_id from agent).
         total_spending = 0.0
         for a in agents:
             results = per_agent.get(a.agent_id)
@@ -531,16 +640,19 @@ class SimulationRunner:
                 continue
             try:
                 updated, spending = _apply_phase_outputs(
-                    a, results, market=market, feed_config=self._feed_config
+                    a, results, market=market, feed_config=cfg.feed
                 )
-            except Exception:  # validation failure -> keep previous state
-                logger.exception("Failed to apply phase outputs for agent %s", a.agent_id)
+            except Exception:
+                logger.exception(
+                    "world=%s: failed to apply phase outputs for agent %s",
+                    cfg.world_id, a.agent_id,
+                )
                 continue
             self._repo.save(updated)
             total_spending += spending
 
-        self._world.last_transaction_volume = total_spending
-        self._world.last_aggregate_labor_hours = _aggregate_labor(agents)
+        state.last_transaction_volume = total_spending
+        state.last_aggregate_labor_hours = _aggregate_labor(agents)
 
     # ------------------------------------------------------------------
     # Main loop
@@ -550,21 +662,30 @@ class SimulationRunner:
         tick = 0
         try:
             while tick < self._max_ticks and not self._shutdown.is_set():
-                logger.info("=== Tick %d / %d ===", tick, self._max_ticks)
-                await self._run_one_tick(tick)
+                logger.info(
+                    "=== Tick %d / %d (worlds=%s) ===",
+                    tick, self._max_ticks,
+                    tuple(self._worlds.keys()),
+                )
+                # Sequential per tick: avoids 3x LLM burst, easier to reason about.
+                for world in self._worlds.values():
+                    if self._shutdown.is_set():
+                        break
+                    await self._run_world_tick(world, tick)
                 tick += 1
         finally:
             await self._flush_final_state(tick)
 
     async def _flush_final_state(self, last_tick: int) -> None:
         try:
-            agents = self._repo.list_all()
-            for a in agents:
-                self._repo.save(a)
-            logger.info(
-                "Final state flushed at tick=%d (agents=%d, metrics_rows=%d).",
-                last_tick, len(agents), len(self._metrics.buffer),
-            )
+            for wid, world in self._worlds.items():
+                agents = self._repo.list_all(world_id=wid)
+                for a in agents:
+                    self._repo.save(a)
+                logger.info(
+                    "world=%s: final state flushed at tick=%d (agents=%d, metrics_rows=%d).",
+                    wid, last_tick, len(agents), len(world.metrics.buffer),
+                )
         except Exception:
             logger.exception("Failed to flush final state.")
 

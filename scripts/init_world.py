@@ -291,23 +291,38 @@ def bootstrap(
     db_url: str,
     n_agents: int = 50,
     seed: int = 0,
+    world_ids: Sequence[str] = ("alpha",),
 ) -> Tuple[Sequence[AgentState], Sequence[Content]]:
-    """Create tables, generate the silicon sample, persist it, return (agents, feed)."""
+    """Create tables, generate one silicon sample, clone it across ``world_ids``.
+
+    The same seeded RNG is used for every world, but the cloned ``AgentState``
+    objects are re-validated with a fresh ``world_id`` so the persisted rows
+    differ on the composite primary key only. This guarantees that the three
+    experimental conditions (Alpha / Beta / Gamma) start from an *identical*
+    initial population — a precondition for clean causal comparison.
+    """
     engine = create_engine(db_url, future=True)
     Base.metadata.create_all(engine)
 
-    agents = generate_population(n_agents, seed=seed)
+    base_agents = generate_population(n_agents, seed=seed)
     repo = AgentStateRepository(engine)
-    for a in agents:
-        repo.save(a)
+
+    cloned: list[AgentState] = []
+    for world_id in world_ids:
+        for a in base_agents:
+            clone = AgentState.model_validate(
+                {**a.model_dump(), "world_id": world_id}
+            )
+            repo.save(clone)
+            cloned.append(clone)
 
     feed = generate_seed_content(seed=seed)
 
     logger.info(
-        "Bootstrapped world: %d agents across %d archetypes, %d seed contents",
-        len(agents), len(_ARCHETYPES), len(feed),
+        "Bootstrapped %d world(s) %s: %d agents each across %d archetypes, %d seed contents",
+        len(world_ids), tuple(world_ids), len(base_agents), len(_ARCHETYPES), len(feed),
     )
-    return agents, feed
+    return cloned, feed
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
