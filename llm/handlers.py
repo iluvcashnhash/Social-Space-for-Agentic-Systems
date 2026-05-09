@@ -89,6 +89,14 @@ class RetryConfig:
     base_delay: float = 0.5            # seconds
     max_delay: float = 8.0
     jitter: float = 0.25               # multiplicative jitter ratio
+    # --- Cognitive-collapse fallback ---
+    # When dynamic temperature is high (stressed agent) the LLM will more
+    # often emit malformed JSON. After this many consecutive parse/validation
+    # failures we *forcibly* drop temperature to ``collapse_temperature`` and
+    # log the incident. This represents the agent's mind giving up on its
+    # impulsive trajectory and reverting to a safe, low-entropy answer.
+    cognitive_collapse_threshold: int = 3
+    collapse_temperature: float = 0.1
 
     def __post_init__(self) -> None:
         if self.max_attempts < 1:
@@ -97,6 +105,10 @@ class RetryConfig:
             raise ValueError("delays must be positive")
         if not (0.0 <= self.jitter < 1.0):
             raise ValueError("jitter must be in [0, 1)")
+        if self.cognitive_collapse_threshold < 1:
+            raise ValueError("cognitive_collapse_threshold must be >= 1")
+        if not (0.0 <= self.collapse_temperature <= 2.0):
+            raise ValueError("collapse_temperature must be in [0, 2]")
 
     def delay_for(self, attempt: int) -> float:
         # attempt is 1-indexed, first retry uses base_delay
@@ -104,6 +116,66 @@ class RetryConfig:
         # symmetric jitter around `raw`
         spread = raw * self.jitter
         return max(0.0, raw + random.uniform(-spread, spread))
+
+
+# ---------------------------------------------------------------------------
+# Dynamic temperature: cognition + debt -> sampling entropy
+# ---------------------------------------------------------------------------
+
+
+# Module-level constants so unit tests can monkey-patch them.
+BASE_TEMPERATURE: float = 0.2
+TEMPERATURE_CAP: float = 1.2
+
+# Weight on the cognitive-load tail (load > 0.5 contributes linearly).
+LOAD_PENALTY_GAIN: float = 1.5
+LOAD_PENALTY_KNEE: float = 0.5
+
+# Weight on extreme indebtedness. Debt is normalised by survival cost: a debt
+# of 5x survival_cost is treated as the "fully extreme" case.
+DEBT_PENALTY_GAIN: float = 0.5
+DEBT_EXTREMITY_SCALE: float = 5.0
+
+# Stress directive injected into the system prompt when temperature crosses
+# this threshold — this is the "cognitive impairment" speech the model is
+# asked to inhabit when its agent is on the edge of burnout / insolvency.
+STRESS_DIRECTIVE_THRESHOLD: float = 0.8
+STRESS_DIRECTIVE: str = (
+    "Твой когнитивный ресурс истощен. "
+    "Твои мысли спутаны, ты склонен к импульсивным решениям и логическим ошибкам."
+)
+
+
+def calculate_dynamic_temperature(agent: AgentState) -> float:
+    """Map agent stress to LLM sampling temperature.
+
+    Two stressors raise the sampling entropy and thereby make the agent's
+    next decision more impulsive and less self-consistent:
+
+    1. **Cognitive load.** Above ``LOAD_PENALTY_KNEE`` (default 0.5) every
+       additional unit of load adds ``LOAD_PENALTY_GAIN`` to the temperature.
+       Below the knee there is no penalty — well-rested agents stay at the
+       deterministic floor.
+
+    2. **Extreme debt.** When ``cash_balance < 0`` we measure the debt in
+       multiples of the agent's ``survival_cost``. Five multiples or more is
+       considered fully extreme and contributes ``DEBT_PENALTY_GAIN``.
+
+    The result is clipped to ``[BASE_TEMPERATURE, TEMPERATURE_CAP]`` so the
+    LLM is never asked to sample below the baseline determinism floor or
+    above the cap that empirically destroys structured-output reliability.
+    """
+
+    cog_load = agent.cognition.cognitive_load
+    load_penalty = max(0.0, cog_load - LOAD_PENALTY_KNEE) * LOAD_PENALTY_GAIN
+
+    survival = max(1e-6, agent.economics.survival_cost)
+    debt_magnitude = max(0.0, -agent.economics.cash_balance)
+    debt_extremity = min(1.0, debt_magnitude / (DEBT_EXTREMITY_SCALE * survival))
+    debt_penalty = debt_extremity * DEBT_PENALTY_GAIN
+
+    raw = BASE_TEMPERATURE + load_penalty + debt_penalty
+    return max(BASE_TEMPERATURE, min(TEMPERATURE_CAP, raw))
 
 
 # ---------------------------------------------------------------------------
@@ -159,6 +231,7 @@ class LLMPhaseCoordinator:
             agent=agent,
             phase=Phase.CONSUMPTION,
             user_message=user_message,
+            temperature=calculate_dynamic_temperature(agent),
         )
 
     async def handle_economic_decision(
@@ -173,6 +246,7 @@ class LLMPhaseCoordinator:
             agent=agent,
             phase=Phase.ECONOMIC_DECISION,
             user_message=user_message,
+            temperature=calculate_dynamic_temperature(agent),
         )
 
     async def handle_reflection(
@@ -187,6 +261,7 @@ class LLMPhaseCoordinator:
             agent=agent,
             phase=Phase.REFLECTION,
             user_message=user_message,
+            temperature=calculate_dynamic_temperature(agent),
         )
 
     # ------------------------------------------------------------------
@@ -214,6 +289,7 @@ class LLMPhaseCoordinator:
             user_message=user_message,
             log_phase="compliance",
             tick=offer.tick,
+            temperature=calculate_dynamic_temperature(agent),
         )
         return ComplianceDecision.model_validate(raw)
 
@@ -226,6 +302,7 @@ class LLMPhaseCoordinator:
         agent: AgentState,
         phase: Phase,
         user_message: str,
+        temperature: Optional[float] = None,
     ) -> Dict[str, Any]:
         system_prompt = build_system_prompt(agent, phase=phase)
         schema_cls = _PHASE_SCHEMA[phase]
@@ -236,6 +313,7 @@ class LLMPhaseCoordinator:
             user_message=user_message,
             log_phase=phase.value,
             tick=getattr(agent, "tick", -1),
+            temperature=temperature,
         )
 
     async def _call_with_schema(
@@ -247,24 +325,56 @@ class LLMPhaseCoordinator:
         user_message: str,
         log_phase: str,
         tick: int,
+        temperature: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Generic structured-output call usable by any schema (phase-agnostic).
 
         Shared retry + JSON-validation policy for the regular phase graph and
         for one-off macro-event phases (e.g. compliance decisions).
+
+        The ``temperature`` argument lets callers inject the dynamic, agent-
+        specific value computed by :func:`calculate_dynamic_temperature`. If
+        the value exceeds :data:`STRESS_DIRECTIVE_THRESHOLD` we splice the
+        Russian-language stress directive into the system prompt, which
+        instructs the LLM to *act* impaired (mirroring the high entropy it is
+        also being asked to sample with). After
+        :attr:`RetryConfig.cognitive_collapse_threshold` consecutive
+        parse/validation failures we forcibly drop the temperature to
+        :attr:`RetryConfig.collapse_temperature` and emit a structured warning
+        — the "cognitive collapse" event the experiment hangs its analysis on.
         """
         json_schema = schema_cls.model_json_schema()
         schema_name = schema_cls.__name__
 
+        # Resolve effective temperature. None -> instance default.
+        effective_temp = self._temperature if temperature is None else temperature
+        # Mutable copy so we can drop it on cognitive collapse.
+        current_temp = effective_temp
+
+        # Splice the stress directive into the system prompt iff we are
+        # operating above the impairment threshold. Doing it once up-front
+        # keeps the prompt stable across retries within the *same* call.
+        effective_system_prompt = system_prompt
+        if current_temp > STRESS_DIRECTIVE_THRESHOLD:
+            effective_system_prompt = (
+                f"{system_prompt}\n\n[COGNITIVE STATE OVERRIDE]\n{STRESS_DIRECTIVE}"
+            )
+
+        # Schema/parse failures are tracked separately from rate-limit errors:
+        # only the former should trip the cognitive-collapse circuit breaker,
+        # because 429s say nothing about agent stress.
+        parse_failures = 0
+        collapsed = False
         last_exc: Optional[BaseException] = None
+
         for attempt in range(1, self._retry.max_attempts + 1):
             try:
                 raw = await self._client.complete(
-                    system=system_prompt,
+                    system=effective_system_prompt,
                     user=user_message,
                     json_schema=json_schema,
                     schema_name=schema_name,
-                    temperature=self._temperature,
+                    temperature=current_temp,
                 )
                 parsed = self._parse_json(raw)
                 # Validate eagerly so a malformed payload triggers a retry
@@ -272,19 +382,53 @@ class LLMPhaseCoordinator:
                 schema_cls.model_validate(parsed)
                 return parsed
             except Exception as exc:
-                # Retry on JSON/validation failures AND on rate-limit errors (429).
                 exc_str = str(exc)
-                is_retryable = isinstance(exc, (json.JSONDecodeError, ValidationError, ValueError)) or (
-                    "429" in exc_str or "rate_limit" in exc_str.lower() or "rate limit" in exc_str.lower()
+                is_rate_limit = (
+                    "429" in exc_str
+                    or "rate_limit" in exc_str.lower()
+                    or "rate limit" in exc_str.lower()
                 )
-                if not is_retryable:
+                is_parse_or_schema = isinstance(
+                    exc, (json.JSONDecodeError, ValidationError, ValueError)
+                )
+                if not (is_parse_or_schema or is_rate_limit):
                     raise
+
                 last_exc = exc
+                if is_parse_or_schema:
+                    parse_failures += 1
+
                 logger.warning(
-                    "LLM phase=%s tick=%d agent=%s attempt=%d/%d failed: %s",
-                    log_phase, tick,
-                    agent.agent_id, attempt, self._retry.max_attempts, exc,
+                    "LLM phase=%s tick=%d agent=%s attempt=%d/%d "
+                    "temp=%.3f parse_failures=%d failed: %s",
+                    log_phase, tick, agent.agent_id, attempt,
+                    self._retry.max_attempts, current_temp, parse_failures, exc,
                 )
+
+                # Cognitive-collapse fallback: only after enough *parse* failures
+                # at high temperature. We collapse exactly once per call, then
+                # let the remaining attempts run at the safe temperature.
+                should_collapse = (
+                    is_parse_or_schema
+                    and not collapsed
+                    and parse_failures >= self._retry.cognitive_collapse_threshold
+                    and current_temp > STRESS_DIRECTIVE_THRESHOLD
+                )
+                if should_collapse:
+                    logger.warning(
+                        "COGNITIVE_COLLAPSE phase=%s tick=%d agent=%s: "
+                        "%d consecutive parse failures at temp=%.3f -> "
+                        "falling back to temp=%.3f for remaining attempts.",
+                        log_phase, tick, agent.agent_id,
+                        parse_failures, current_temp,
+                        self._retry.collapse_temperature,
+                    )
+                    current_temp = self._retry.collapse_temperature
+                    # Strip the stress directive — the agent's mind has just
+                    # given up on its impulsive trajectory.
+                    effective_system_prompt = system_prompt
+                    collapsed = True
+
                 if attempt == self._retry.max_attempts:
                     break
                 await asyncio.sleep(self._retry.delay_for(attempt))
