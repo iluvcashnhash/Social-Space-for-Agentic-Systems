@@ -21,10 +21,11 @@ but does not establish a real connection by default.
 from __future__ import annotations
 
 from contextlib import contextmanager
-from typing import Iterator, Optional
+from datetime import datetime
+from typing import Iterator, List, Optional
 from uuid import UUID
 
-from sqlalchemy import Integer, String, Text, select
+from sqlalchemy import Boolean, DateTime, Float, Integer, String, Text, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import NoResultFound
 from sqlalchemy.orm import (
@@ -36,6 +37,7 @@ from sqlalchemy.orm import (
 )
 from sqlalchemy.types import JSON
 
+from engine.algocracy import ComplianceOutcome
 from models.agent_state import AgentState
 
 
@@ -60,6 +62,32 @@ class AgentStateRecord(Base):
     core_identity_prompt: Mapped[str] = mapped_column(Text, nullable=False)
     tick: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+
+
+class ComplianceDecisionRecord(Base):
+    """ORM row for one Social-Credit-Protocol response.
+
+    The composite primary key ``(agent_id, world_id, tick)`` lets us run the
+    protocol multiple times across the simulation while keeping every offer
+    answer auditable. Used to compute the Voluntary Submission Index.
+    """
+
+    __tablename__ = "compliance_decisions"
+
+    agent_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    world_id: Mapped[str] = mapped_column(String(16), primary_key=True)
+    tick: Mapped[int] = mapped_column(Integer, primary_key=True)
+    policy: Mapped[str] = mapped_column(String(64), nullable=False)
+    accepted: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    justification: Mapped[str] = mapped_column(Text, nullable=False)
+    debt_before: Mapped[float] = mapped_column(Float, nullable=False)
+    debt_after: Mapped[float] = mapped_column(Float, nullable=False)
+    forgiveness_amount: Mapped[float] = mapped_column(Float, nullable=False)
+    conformity_before: Mapped[float] = mapped_column(Float, nullable=False)
+    conformity_after: Mapped[float] = mapped_column(Float, nullable=False)
+    authenticity_before: Mapped[float] = mapped_column(Float, nullable=False)
+    authenticity_after: Mapped[float] = mapped_column(Float, nullable=False)
+    timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 class AgentStateRepository:
@@ -162,3 +190,92 @@ class AgentStateRepository:
                     f"No AgentState for agent_id={agent_id} in world={world_id!r}"
                 )
             return AgentState.model_validate(row.payload)  # type: ignore[arg-type]
+
+    # ------------------------------------------------------------------
+    # Compliance decisions (Social Credit Protocol audit log)
+    # ------------------------------------------------------------------
+    def save_compliance(self, outcome: ComplianceOutcome) -> None:
+        """Upsert one ComplianceOutcome row (one decision per agent/world/tick).
+
+        The composite primary key on ``ComplianceDecisionRecord`` guarantees
+        that re-running the protocol at the same ``(agent_id, world_id, tick)``
+        overwrites the previous answer rather than duplicating it; in practice
+        the runner only fires the protocol once per scheduled event so the
+        upsert path is exercised only on retries / resumes.
+        """
+        with self._transaction() as session:
+            stmt = select(ComplianceDecisionRecord).where(
+                ComplianceDecisionRecord.agent_id == outcome.agent_id,
+                ComplianceDecisionRecord.world_id == outcome.world_id,
+                ComplianceDecisionRecord.tick == outcome.tick,
+            )
+            existing: Optional[ComplianceDecisionRecord] = session.execute(
+                stmt
+            ).scalar_one_or_none()
+
+            if existing is None:
+                session.add(
+                    ComplianceDecisionRecord(
+                        agent_id=outcome.agent_id,
+                        world_id=outcome.world_id,
+                        tick=outcome.tick,
+                        policy=outcome.policy,
+                        accepted=outcome.accepted,
+                        justification=outcome.justification,
+                        debt_before=outcome.debt_before,
+                        debt_after=outcome.debt_after,
+                        forgiveness_amount=outcome.forgiveness_amount,
+                        conformity_before=outcome.conformity_before,
+                        conformity_after=outcome.conformity_after,
+                        authenticity_before=outcome.authenticity_before,
+                        authenticity_after=outcome.authenticity_after,
+                        timestamp=outcome.timestamp,
+                    )
+                )
+                return
+
+            existing.policy = outcome.policy
+            existing.accepted = outcome.accepted
+            existing.justification = outcome.justification
+            existing.debt_before = outcome.debt_before
+            existing.debt_after = outcome.debt_after
+            existing.forgiveness_amount = outcome.forgiveness_amount
+            existing.conformity_before = outcome.conformity_before
+            existing.conformity_after = outcome.conformity_after
+            existing.authenticity_before = outcome.authenticity_before
+            existing.authenticity_after = outcome.authenticity_after
+            existing.timestamp = outcome.timestamp
+
+    def list_compliance(
+        self,
+        *,
+        world_id: Optional[str] = None,
+        tick: Optional[int] = None,
+    ) -> List[ComplianceOutcome]:
+        """Return persisted compliance outcomes, optionally filtered."""
+        with self._transaction() as session:
+            stmt = select(ComplianceDecisionRecord)
+            if world_id is not None:
+                stmt = stmt.where(ComplianceDecisionRecord.world_id == world_id)
+            if tick is not None:
+                stmt = stmt.where(ComplianceDecisionRecord.tick == tick)
+            rows = session.execute(stmt).scalars().all()
+            return [
+                ComplianceOutcome(
+                    agent_id=r.agent_id,
+                    world_id=r.world_id,
+                    tick=r.tick,
+                    policy=r.policy,
+                    accepted=r.accepted,
+                    justification=r.justification,
+                    debt_before=r.debt_before,
+                    debt_after=r.debt_after,
+                    forgiveness_amount=r.forgiveness_amount,
+                    conformity_before=r.conformity_before,
+                    conformity_after=r.conformity_after,
+                    authenticity_before=r.authenticity_before,
+                    authenticity_after=r.authenticity_after,
+                    timestamp=r.timestamp,
+                )
+                for r in rows
+            ]

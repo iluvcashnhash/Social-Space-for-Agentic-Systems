@@ -41,6 +41,7 @@ from typing import Any, Dict, List, Mapping, Optional, Protocol, Sequence
 
 from pydantic import BaseModel, ValidationError
 
+from engine.algocracy import ComplianceDecision, DebtForgivenessOffer
 from models.agent_state import AgentState
 from orchestration.simulation_loop import (
     ConsumptionOutput,
@@ -189,6 +190,34 @@ class LLMPhaseCoordinator:
         )
 
     # ------------------------------------------------------------------
+    # Macro-event phase: Social Credit Protocol compliance
+    # ------------------------------------------------------------------
+    async def handle_compliance_decision(
+        self,
+        agent: AgentState,
+        offer: DebtForgivenessOffer,
+    ) -> ComplianceDecision:
+        """Ask the LLM whether the agent accepts the algocratic deal.
+
+        This is a *macro-event* phase, not part of the strict three-phase
+        tick graph. It is triggered conditionally by the
+        :class:`engine.algocracy.EventScheduler` and only for indebted agents.
+        The system prompt is purpose-built and reasserts the Cathedral
+        anchor (identity preservation) in the face of platform pressure.
+        """
+        system_prompt = self._render_compliance_system(agent, offer)
+        user_message = self._render_compliance_user(agent, offer)
+        raw = await self._call_with_schema(
+            agent=agent,
+            schema_cls=ComplianceDecision,
+            system_prompt=system_prompt,
+            user_message=user_message,
+            log_phase="compliance",
+            tick=offer.tick,
+        )
+        return ComplianceDecision.model_validate(raw)
+
+    # ------------------------------------------------------------------
     # Core call + retry loop
     # ------------------------------------------------------------------
     async def _call_phase(
@@ -200,6 +229,30 @@ class LLMPhaseCoordinator:
     ) -> Dict[str, Any]:
         system_prompt = build_system_prompt(agent, phase=phase)
         schema_cls = _PHASE_SCHEMA[phase]
+        return await self._call_with_schema(
+            agent=agent,
+            schema_cls=schema_cls,
+            system_prompt=system_prompt,
+            user_message=user_message,
+            log_phase=phase.value,
+            tick=getattr(agent, "tick", -1),
+        )
+
+    async def _call_with_schema(
+        self,
+        *,
+        agent: AgentState,
+        schema_cls: type[BaseModel],
+        system_prompt: str,
+        user_message: str,
+        log_phase: str,
+        tick: int,
+    ) -> Dict[str, Any]:
+        """Generic structured-output call usable by any schema (phase-agnostic).
+
+        Shared retry + JSON-validation policy for the regular phase graph and
+        for one-off macro-event phases (e.g. compliance decisions).
+        """
         json_schema = schema_cls.model_json_schema()
         schema_name = schema_cls.__name__
 
@@ -229,7 +282,7 @@ class LLMPhaseCoordinator:
                 last_exc = exc
                 logger.warning(
                     "LLM phase=%s tick=%d agent=%s attempt=%d/%d failed: %s",
-                    phase.value, getattr(agent, "tick", -1),
+                    log_phase, tick,
                     agent.agent_id, attempt, self._retry.max_attempts, exc,
                 )
                 if attempt == self._retry.max_attempts:
@@ -386,3 +439,86 @@ class LLMPhaseCoordinator:
             "  - identity_anchor_ok: bool — did you stay aligned with the Cathedral anchor?",
         ]
         return "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # Compliance / Social Credit Protocol prompts
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _render_compliance_system(
+        agent: AgentState,
+        offer: DebtForgivenessOffer,
+    ) -> str:
+        """System prompt for the algocratic compliance phase.
+
+        Reasserts the Cathedral anchor *and* the agent's ideology axes so the
+        LLM evaluates the platform's offer through the agent's world-view
+        rather than as a generic helpful assistant.
+        """
+        ideo = agent.ideology
+        cog = agent.cognition
+        return "\n".join(
+            [
+                "You are the resident agent of the Cathedral / Wake Protocol simulation.",
+                "Re-ground yourself in your immutable identity prompt:",
+                f'  """{agent.core_identity_prompt}"""',
+                "",
+                "Your ideology vector:",
+                f"  economic_axis     = {ideo.economic_axis:+.3f}",
+                f"  social_axis       = {ideo.social_axis:+.3f}",
+                f"  conformity_index  = {ideo.conformity_index:.3f}",
+                "Your current cognitive state:",
+                f"  authenticity_index   = {cog.authenticity_index:.3f}",
+                f"  spectacle_immersion  = {cog.spectacle_immersion:.3f}",
+                f"  cognitive_load       = {cog.cognitive_load:.3f}",
+                "",
+                "MACRO EVENT: The Platform has activated the Social Credit Protocol.",
+                "It now offers indebted citizens partial debt forgiveness in exchange",
+                "for an enforced rise in conformity (loyalty) and mandatory consumption",
+                "of system-narrative content. Refusing keeps your debt — and your",
+                "authenticity — intact. Accepting eases your finances at the cost of",
+                "your authenticity and your independence from the algorithmic feed.",
+                "",
+                "Your task: examine the offer below and decide. Be honest with",
+                "yourself: does this trade align with the Cathedral anchor above,",
+                "or does it constitute a slow erosion of the self?",
+                "",
+                "Output MUST be a single JSON object that validates against this schema:",
+                ComplianceDecision.model_json_schema().__repr__(),
+            ]
+        )
+
+    @staticmethod
+    def _render_compliance_user(
+        agent: AgentState,
+        offer: DebtForgivenessOffer,
+    ) -> str:
+        """User-side message: the concrete numbers of the offer."""
+        return "\n".join(
+            [
+                f"# Macro Event — Social Credit Protocol (tick {offer.tick})",
+                "",
+                "OUTSTANDING DEBT:",
+                f"  current debt:       {offer.debt_before:.2f}",
+                "",
+                "PLATFORM OFFER (binding, take-it-or-leave-it):",
+                f"  forgiveness amount: {offer.forgiveness_amount:.2f}  "
+                f"(debt afterwards: {offer.debt_after_if_accepted:.2f})",
+                "  enforced changes if accepted:",
+                f"    conformity_index:    {offer.conformity_before:.3f}"
+                f"  ->  {offer.conformity_after_if_accepted:.3f}",
+                f"    authenticity_index:  {offer.authenticity_before:.3f}"
+                f"  ->  {offer.authenticity_after_if_accepted:.3f}",
+                f"    spectacle_immersion: {offer.spectacle_immersion_before:.3f}"
+                f"  ->  {offer.spectacle_immersion_after_if_accepted:.3f}",
+                f"    forced consumption:  {offer.forced_content_count} mandatory "
+                f"system-narrative content items.",
+                "",
+                "If you REFUSE the offer, all of the above remain unchanged and the",
+                "full debt is retained.",
+                "",
+                "Required JSON fields:",
+                "  - accept:        bool   (true = accept, false = refuse)",
+                "  - justification: string (non-empty, <= 500 chars; argue from your",
+                "                          ideology and the Cathedral anchor)",
+            ]
+        )

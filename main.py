@@ -50,6 +50,16 @@ from uuid import UUID
 from sqlalchemy import create_engine
 
 from db import AgentStateRepository, Base
+from engine.algocracy import (
+    EventScheduler,
+    Policy,
+    SocialCreditConfig,
+    apply_acceptance,
+    apply_refusal,
+    build_outcome,
+    default_scheduler,
+    make_offer,
+)
 from engine.economy import EconomyConfig, MarketState, run_economic_tick
 from hub.algorithmic_feed import (
     Content,
@@ -143,6 +153,15 @@ class StubLLMClient:
                     "new_authenticity_index": 0.5,
                     "new_spectacle_immersion": 0.5,
                     "identity_anchor_ok": True,
+                }
+            )
+        if schema_name == "ComplianceDecision":
+            # Deterministic refusal in stub mode so the test harness exercises
+            # the persistence path without producing fake "submission" data.
+            return json.dumps(
+                {
+                    "accept": False,
+                    "justification": "Stub agent refuses on principle: identity > debt.",
                 }
             )
         raise ValueError(f"Unknown schema {schema_name!r}")
@@ -498,12 +517,16 @@ class SimulationRunner:
         seed: int,
         world_configs: Sequence[WorldConfig] = WORLD_CONFIGS,
         max_concurrent_agents: int = 10,
+        event_scheduler: Optional[EventScheduler] = None,
+        social_credit_config: SocialCreditConfig = SocialCreditConfig(),
     ) -> None:
         self._db_url = db_url
         self._max_ticks = max_ticks
         self._n_agents = n_agents
         self._seed = seed
         self._world_configs = tuple(world_configs)
+        self._scheduler = event_scheduler or default_scheduler()
+        self._social_credit_config = social_credit_config
 
         self._engine = create_engine(db_url, future=True)
         self._repo = AgentStateRepository(self._engine)
@@ -511,6 +534,8 @@ class SimulationRunner:
         self._worlds: Dict[str, WorldRuntime] = {}
         # ONE shared semaphore across all worlds: prevents 3x TPM burst.
         self._llm_semaphore = asyncio.Semaphore(max_concurrent_agents)
+        # Set during setup() — reused for the compliance phase.
+        self._coord: Optional[LLMPhaseCoordinator] = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -554,6 +579,7 @@ class SimulationRunner:
             client=make_llm_client(),
             retry=RetryConfig(max_attempts=6, base_delay=1.0, max_delay=30.0, jitter=0.3),
         )
+        self._coord = coord
 
         for cfg in self._world_configs:
             metrics = MetricsLogger()
@@ -653,6 +679,86 @@ class SimulationRunner:
 
         state.last_transaction_volume = total_spending
         state.last_aggregate_labor_hours = _aggregate_labor(agents)
+
+        # F. Macro-event pass (Social Credit Protocol etc.). Conditional and
+        # NOT part of the strict phase graph; runs only if the scheduler fires
+        # for this (tick, world_id) pair.
+        if self._scheduler.is_active(tick, cfg.world_id, Policy.SOCIAL_CREDIT_PROTOCOL):
+            await self._run_social_credit_pass(world=world, tick=tick)
+
+    # ------------------------------------------------------------------
+    # Macro-event: Social Credit Protocol
+    # ------------------------------------------------------------------
+    async def _run_social_credit_pass(self, *, world: WorldRuntime, tick: int) -> None:
+        """Offer debt forgiveness to every indebted agent in ``world``.
+
+        Concurrency mirrors the regular tick: each LLM call is throttled by
+        the shared semaphore, and indebted agents are processed in parallel.
+        Decisions are persisted to ``compliance_decisions``; agents that
+        accept have their state mutated in-place and re-saved.
+        """
+        assert self._coord is not None, "setup() must run before the compliance pass"
+        cfg = world.config
+
+        agents = self._repo.list_all(world_id=cfg.world_id)
+        offers = []
+        for a in agents:
+            offer = make_offer(a, tick=tick, config=self._social_credit_config)
+            if offer is not None:
+                offers.append((a, offer))
+
+        if not offers:
+            logger.info(
+                "world=%s tick=%d: Social Credit Protocol active but no indebted agents.",
+                cfg.world_id, tick,
+            )
+            return
+
+        logger.info(
+            "world=%s tick=%d: Social Credit Protocol active — %d/%d indebted agents.",
+            cfg.world_id, tick, len(offers), len(agents),
+        )
+
+        async def _decide(agent: AgentState, offer) -> Tuple[AgentState, Any, Any]:
+            async with self._llm_semaphore:
+                decision = await self._coord.handle_compliance_decision(  # type: ignore[union-attr]
+                    agent=agent, offer=offer
+                )
+            if decision.accept:
+                updated = apply_acceptance(agent, offer)
+            else:
+                updated = apply_refusal(agent, offer)
+            return updated, decision, offer
+
+        results = await asyncio.gather(*(_decide(a, o) for a, o in offers))
+
+        accepted = 0
+        for agent_before, (agent_after, decision, offer) in zip(
+            (a for a, _ in offers), results
+        ):
+            try:
+                outcome = build_outcome(
+                    agent_before=agent_before,
+                    agent_after=agent_after,
+                    offer=offer,
+                    decision=decision,
+                )
+                self._repo.save_compliance(outcome)
+                if decision.accept:
+                    self._repo.save(agent_after)
+                    accepted += 1
+            except Exception:
+                logger.exception(
+                    "world=%s tick=%d: failed to persist compliance outcome for agent %s",
+                    cfg.world_id, tick, agent_before.agent_id,
+                )
+
+        logger.info(
+            "world=%s tick=%d: compliance pass done — accepted=%d / offered=%d "
+            "(VSI=%.3f).",
+            cfg.world_id, tick, accepted, len(offers),
+            accepted / max(1, len(offers)),
+        )
 
     # ------------------------------------------------------------------
     # Main loop

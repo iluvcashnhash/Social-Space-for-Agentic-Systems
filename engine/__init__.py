@@ -1,5 +1,19 @@
 """Deterministic simulation engine for the Cathedral / Wake Protocol ABM."""
 
+from engine.algocracy import (
+    ComplianceDecision,
+    ComplianceOutcome,
+    DebtForgivenessOffer,
+    EventScheduler,
+    Policy,
+    ScheduledEvent,
+    SocialCreditConfig,
+    apply_acceptance,
+    apply_refusal,
+    build_outcome,
+    default_scheduler,
+    make_offer,
+)
 from engine.economy import (
     EconomyConfig,
     FiscalReport,
@@ -12,6 +26,7 @@ from engine.economy import (
 )
 
 __all__ = [
+    # Economy
     "EconomyConfig",
     "FiscalReport",
     "MarketState",
@@ -20,4 +35,17 @@ __all__ = [
     "walrasian_price_update",
     "endogenous_robotization",
     "run_economic_tick",
+    # Algocracy
+    "ComplianceDecision",
+    "ComplianceOutcome",
+    "DebtForgivenessOffer",
+    "EventScheduler",
+    "Policy",
+    "ScheduledEvent",
+    "SocialCreditConfig",
+    "apply_acceptance",
+    "apply_refusal",
+    "build_outcome",
+    "default_scheduler",
+    "make_offer",
 ]
