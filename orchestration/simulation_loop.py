@@ -1,12 +1,12 @@
 """
-Phase-graph orchestration for the Cathedral / Wake Protocol ABM.
+Phase-graph orchestration for multi-agent daily cycles.
 
 Why a phase graph?
 ------------------
-Naïve "everyone talks to everyone" multi-agent loops are the well-known
-**Multi-Agent Trap**: agents endlessly hallucinate at each other until the
-context window collapses. We avoid this by forcing every tick through a
-*directed acyclic* state machine with three hard phases:
+Naïve "everyone talks to everyone" multi-agent loops suffer from
+context-window collapse as agents endlessly respond to each other. We avoid
+this by forcing every tick through a *directed acyclic* state machine with
+three hard phases:
 
     CONSUMPTION  ──►  ECONOMIC_DECISION  ──►  REFLECTION  ──►  (next tick)
 
@@ -19,7 +19,7 @@ AG2 / AutoGen v0.4 integration
 This module is built on top of an asyncio event bus that mirrors the
 ``autogen_core`` runtime API (``publish`` / ``subscribe`` / message types).
 If ``autogen_core`` is installed it is used directly; otherwise the
-in-process ``_LocalEventBus`` provides the same contract so the simulation
+in-process ``_LocalEventBus`` provides the same contract so the system
 runs offline as well. The agent-to-agent transport is *not* the place
 where phase ordering is enforced — the ``SimulationLoop`` state machine is.
 """
@@ -49,7 +49,7 @@ except Exception:  # pragma: no cover
     _HAS_AUTOGEN = False
 
 
-logger = logging.getLogger("cathedral.orchestration")
+logger = logging.getLogger("orchestration.loop")
 
 
 # ---------------------------------------------------------------------------
@@ -84,7 +84,7 @@ class PhaseTransition:
 
 
 class ConsumptionOutput(BaseModel):
-    """Structured output of phase 1 (information consumption)."""
+    """Твой отчёт о том, что ты сегодня прочитал и почувствовал."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -95,7 +95,7 @@ class ConsumptionOutput(BaseModel):
 
 
 class EconomicDecision(BaseModel):
-    """Structured output of phase 2 (time / budget allocation)."""
+    """Твой план на день: сколько времени уделить работе, творчеству, отдыху."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -126,7 +126,7 @@ class EconomicDecision(BaseModel):
 
 
 class Reflection(BaseModel):
-    """Structured output of phase 3 (reflection / self-evaluation)."""
+    """Твои личные итоги дня: как ты себя чувствуешь и верен ли себе."""
 
     model_config = ConfigDict(extra="forbid")
 

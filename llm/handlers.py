@@ -1,5 +1,5 @@
 """
-LLM phase handlers for the Cathedral / Wake Protocol simulation loop.
+LLM phase handlers for the daily-cycle orchestration.
 
 This module bridges :class:`orchestration.simulation_loop.SimulationLoop`
 (which expects coroutines ``(agent, tick, ctx) -> Mapping[str, Any]``) with a
@@ -13,7 +13,7 @@ Each handler:
 
 1. Builds a phase-specific *system* prompt via
    :func:`orchestration.simulation_loop.build_system_prompt`, which already
-   contains the Cathedral anchor, the echo-chamber confirmation-bias
+   contains the identity anchor, the echo-chamber confirmation-bias
    injection, and (when applicable) the burnout escalation clause.
 2. Builds a *user* message that injects the runtime context for that phase
    (available content, prices + UBI, last-tick recap).
@@ -53,7 +53,7 @@ from orchestration.simulation_loop import (
 )
 
 
-logger = logging.getLogger("cathedral.llm")
+logger = logging.getLogger("llm.phase_handlers")
 
 
 # ---------------------------------------------------------------------------
@@ -278,8 +278,8 @@ class LLMPhaseCoordinator:
         This is a *macro-event* phase, not part of the strict three-phase
         tick graph. It is triggered conditionally by the
         :class:`engine.algocracy.EventScheduler` and only for indebted agents.
-        The system prompt is purpose-built and reasserts the Cathedral
-        anchor (identity preservation) in the face of platform pressure.
+        The system prompt is purpose-built and reasserts the identity
+        anchor (self-preservation) in the face of platform pressure.
         """
         system_prompt = self._render_compliance_system(agent, offer)
         user_message = self._render_compliance_user(agent, offer)
