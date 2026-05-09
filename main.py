@@ -149,6 +149,61 @@ class StubLLMClient:
         raise ValueError(f"Unknown schema {schema_name!r}")
 
 
+def _resolve_refs(schema: Dict[str, Any], defs: Dict[str, Any]) -> Dict[str, Any]:
+    """Inline all ``$ref`` pointers so the schema is self-contained."""
+    if "$ref" in schema:
+        ref_name = schema["$ref"].split("/")[-1]
+        resolved = dict(defs.get(ref_name, {}))
+        # Merge any sibling keys (e.g. description) alongside the resolved ref.
+        for k, v in schema.items():
+            if k != "$ref":
+                resolved[k] = v
+        return _resolve_refs(resolved, defs)
+    result = {}
+    for k, v in schema.items():
+        if k == "$defs":
+            continue
+        if isinstance(v, dict):
+            result[k] = _resolve_refs(v, defs)
+        elif isinstance(v, list):
+            result[k] = [
+                _resolve_refs(i, defs) if isinstance(i, dict) else i for i in v
+            ]
+        else:
+            result[k] = v
+    return result
+
+
+def _strict_schema(schema: Mapping[str, Any]) -> Dict[str, Any]:
+    """
+    Coerce a Pydantic-generated JSON Schema to satisfy OpenAI Structured Outputs:
+      - Inline all ``$ref`` / ``$defs`` (OpenAI does not support them).
+      - ``required`` must list every key in ``properties``.
+      - Remove ``default`` values (not allowed in strict mode).
+      - Set ``additionalProperties: false`` on every object node.
+    Applied recursively so nested objects (e.g. time_allocation) also pass.
+    """
+    defs: Dict[str, Any] = dict(schema).get("$defs", {})
+    schema = _resolve_refs(dict(schema), defs)
+
+    schema.pop("default", None)
+    schema.pop("$schema", None)
+    schema.pop("title", None)
+
+    if schema.get("type") == "object" and "properties" in schema:
+        schema["additionalProperties"] = False
+        schema["required"] = list(schema["properties"].keys())
+        schema["properties"] = {
+            k: _strict_schema(v) for k, v in schema["properties"].items()
+        }
+    for kw in ("anyOf", "allOf", "oneOf"):
+        if kw in schema:
+            schema[kw] = [_strict_schema(s) for s in schema[kw]]
+    if "items" in schema:
+        schema["items"] = _strict_schema(schema["items"])
+    return schema
+
+
 class OpenAIChatClient:
     """Thin async adapter over ``openai.AsyncOpenAI`` with structured outputs."""
 
@@ -167,6 +222,7 @@ class OpenAIChatClient:
         schema_name: str,
         temperature: float = 0.2,
     ) -> str:
+        strict = _strict_schema(json_schema)
         response = await self._client.chat.completions.create(
             model=self._model,
             temperature=temperature,
@@ -174,7 +230,7 @@ class OpenAIChatClient:
                 "type": "json_schema",
                 "json_schema": {
                     "name": schema_name,
-                    "schema": json_schema,
+                    "schema": strict,
                     "strict": True,
                 },
             },
@@ -300,7 +356,7 @@ def _apply_phase_outputs(
     decision = results[Phase.ECONOMIC_DECISION].payload
     reflection = results[Phase.REFLECTION].payload
 
-    rest_hours = float(decision.time_allocation["rest"])  # type: ignore[attr-defined]
+    rest_hours = float(decision.rest)  # type: ignore[attr-defined]
     load_update = update_cognitive_load(
         agent=agent,
         info_volume=float(consumption.info_volume),  # type: ignore[attr-defined]
@@ -316,6 +372,7 @@ def _apply_phase_outputs(
     )
     new_cognition = CognitiveProfile.model_validate(cognition_dict)
 
+    # EconomicDecision now exposes .time_allocation as a property returning a dict.
     time_alloc: Dict[str, float] = dict(decision.time_allocation)  # type: ignore[attr-defined]
     if load_update.is_burnout and time_alloc.get("creation", 0.0) > 0.0:
         # Block creation next tick; transfer the freed hours to rest.
@@ -406,7 +463,10 @@ class SimulationRunner:
 
         self._world.feed = list(self._seed_feed)
 
-        coord = LLMPhaseCoordinator(client=make_llm_client(), retry=RetryConfig())
+        coord = LLMPhaseCoordinator(
+            client=make_llm_client(),
+            retry=RetryConfig(max_attempts=6, base_delay=1.0, max_delay=30.0, jitter=0.3),
+        )
         self._loop = SimulationLoop(
             handlers={
                 Phase.CONSUMPTION: coord.handle_consumption,

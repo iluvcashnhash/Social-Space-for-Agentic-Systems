@@ -98,19 +98,29 @@ class EconomicDecision(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    time_allocation: Dict[str, float]
+    labor: float = Field(..., ge=0.0, description="Hours spent on labor.")
+    creation: float = Field(..., ge=0.0, description="Hours spent on creation.")
+    spectacle: float = Field(..., ge=0.0, description="Hours spent on spectacle.")
+    rest: float = Field(..., ge=0.0, description="Hours spent on rest.")
     spending: float = Field(..., ge=0.0)
     savings: float = Field(..., ge=0.0)
 
-    @field_validator("time_allocation")
+    @property
+    def time_allocation(self) -> Dict[str, float]:
+        return {
+            "labor": self.labor,
+            "creation": self.creation,
+            "spectacle": self.spectacle,
+            "rest": self.rest,
+        }
+
+    @field_validator("rest", mode="after")
     @classmethod
-    def _check_24h(cls, v: Dict[str, float]) -> Dict[str, float]:
-        if set(v.keys()) != REQUIRED_TIME_SLOTS:
-            raise ValueError(f"time_allocation must cover exactly {sorted(REQUIRED_TIME_SLOTS)}")
-        if any(x < 0 for x in v.values()):
-            raise ValueError("time_allocation values must be non-negative")
-        if abs(sum(v.values()) - DAY_HOURS) > 1e-6:
-            raise ValueError(f"time_allocation must sum to {DAY_HOURS}")
+    def _check_24h(cls, v: float, info: Any) -> float:
+        data = info.data
+        total = data.get("labor", 0.0) + data.get("creation", 0.0) + data.get("spectacle", 0.0) + v
+        if abs(total - DAY_HOURS) > 1e-6:
+            raise ValueError(f"labor+creation+spectacle+rest must sum to {DAY_HOURS}, got {total}")
         return v
 
 
@@ -314,6 +324,7 @@ class SimulationLoop:
         handlers: Mapping[Phase, PhaseHandler],
         metrics_logger: MetricsLogger,
         bus: Optional[Any] = None,
+        max_concurrent_agents: int = 10,
     ) -> None:
         missing = set(_PHASE_SCHEMA) - set(handlers)
         if missing:
@@ -321,6 +332,7 @@ class SimulationLoop:
         self._handlers = dict(handlers)
         self._metrics = metrics_logger
         self._bus = bus if bus is not None else self._default_bus()
+        self._semaphore = asyncio.Semaphore(max_concurrent_agents)
 
     @staticmethod
     def _default_bus() -> Any:
@@ -386,6 +398,15 @@ class SimulationLoop:
     # ------------------------------------------------------------------
     # Population-level tick
     # ------------------------------------------------------------------
+    async def _run_agent_guarded(
+        self,
+        agent: AgentState,
+        tick: int,
+        context: Optional[Dict[str, Any]],
+    ) -> Dict[Phase, PhaseResult]:
+        async with self._semaphore:
+            return await self.run_tick_for_agent(agent, tick, initial_context=context)
+
     async def run_tick(
         self,
         agents: Sequence[AgentState],
@@ -396,11 +417,11 @@ class SimulationLoop:
         emission_deficit: float = 0.0,
         contexts: Optional[Mapping[UUID, Dict[str, Any]]] = None,
     ) -> Dict[UUID, Dict[Phase, PhaseResult]]:
-        """Run one tick for every agent and emit a population-level metrics row."""
+        """Run one tick for every agent, throttled by semaphore to avoid rate limits."""
         contexts = contexts or {}
         results = await asyncio.gather(
             *(
-                self.run_tick_for_agent(a, tick, initial_context=contexts.get(a.agent_id))
+                self._run_agent_guarded(a, tick, contexts.get(a.agent_id))
                 for a in agents
             )
         )

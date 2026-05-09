@@ -218,7 +218,14 @@ class LLMPhaseCoordinator:
                 # *before* the SimulationLoop gate also rejects it.
                 schema_cls.model_validate(parsed)
                 return parsed
-            except (json.JSONDecodeError, ValidationError, ValueError) as exc:
+            except Exception as exc:
+                # Retry on JSON/validation failures AND on rate-limit errors (429).
+                exc_str = str(exc)
+                is_retryable = isinstance(exc, (json.JSONDecodeError, ValidationError, ValueError)) or (
+                    "429" in exc_str or "rate_limit" in exc_str.lower() or "rate limit" in exc_str.lower()
+                )
+                if not is_retryable:
+                    raise
                 last_exc = exc
                 logger.warning(
                     "LLM phase=%s tick=%d agent=%s attempt=%d/%d failed: %s",
@@ -330,9 +337,11 @@ class LLMPhaseCoordinator:
                 "  labor, creation, spectacle, rest",
                 "Decide your spending and savings (both >= 0).",
                 "",
-                "Required JSON fields:",
-                "  - time_allocation: object with keys "
-                "{'labor','creation','spectacle','rest'}, values summing to 24.0",
+                "Required JSON fields (all values >= 0, labor+creation+spectacle+rest must sum to 24.0):",
+                "  - labor:    float   (hours on paid work)",
+                "  - creation: float   (hours on self-directed creation)",
+                "  - spectacle:float   (hours on media / entertainment)",
+                "  - rest:     float   (hours on sleep and recovery)",
                 "  - spending: float >= 0",
                 "  - savings:  float >= 0",
             ]
@@ -359,7 +368,8 @@ class LLMPhaseCoordinator:
             f"  aggregate_rpe      = {consumption.get('aggregate_rpe')}",
             "",
             "Phase 2 summary (economic decision):",
-            f"  time_allocation    = {decision.get('time_allocation')}",
+            f"  labor/creation/spectacle/rest = "
+            f"{decision.get('labor')}/{decision.get('creation')}/{decision.get('spectacle')}/{decision.get('rest')}",
             f"  spending           = {decision.get('spending')}",
             f"  savings            = {decision.get('savings')}",
             "",
