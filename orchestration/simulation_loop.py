@@ -435,29 +435,54 @@ class SimulationLoop:
         emission_deficit: float = 0.0,
         contexts: Optional[Mapping[UUID, Dict[str, Any]]] = None,
     ) -> Dict[UUID, Dict[Phase, PhaseResult]]:
-        """Run one tick for every agent, throttled by semaphore to avoid rate limits."""
+        """Run one tick for every agent, throttled by semaphore to avoid rate limits.
+
+        Implements the "Frozen Orphans" policy: if an agent's LLM calls fail
+        repeatedly, that agent is skipped for this tick (state unchanged) while
+        the rest of the world continues. Failed agents will retry on next tick.
+        """
         contexts = contexts or {}
         results = await asyncio.gather(
             *(
                 self._run_agent_guarded(a, tick, contexts.get(a.agent_id))
                 for a in agents
-            )
+            ),
+            return_exceptions=True,
         )
-        per_agent: Dict[UUID, Dict[Phase, PhaseResult]] = {
-            a.agent_id: r for a, r in zip(agents, results)
-        }
 
-        await self._metrics.log(
-            self._aggregate_metrics(
-                agents=agents,
-                tick=tick,
-                prices=prices,
-                per_agent=per_agent,
-                automation_triggered=automation_triggered,
-                emission_deficit=emission_deficit,
-                world_id=self._world_id,
+        per_agent: Dict[UUID, Dict[Phase, PhaseResult]] = {}
+        failed_agents: List[UUID] = []
+
+        for agent, result in zip(agents, results):
+            if isinstance(result, Exception):
+                logger.error(
+                    "Frozen orphan: agent=%s tick=%d world=%s failed: %s",
+                    agent.agent_id, tick, self._world_id, result
+                )
+                failed_agents.append(agent.agent_id)
+                continue
+            per_agent[agent.agent_id] = result
+
+        if failed_agents:
+            logger.warning(
+                "Tick %d world=%s: %d/%d agents frozen (orphaned): %s",
+                tick, self._world_id, len(failed_agents), len(agents),
+                [str(a) for a in failed_agents]
             )
-        )
+
+        if per_agent:
+            await self._metrics.log(
+                self._aggregate_metrics(
+                    agents=[a for a in agents if a.agent_id in per_agent],
+                    tick=tick,
+                    prices=prices,
+                    per_agent=per_agent,
+                    automation_triggered=automation_triggered,
+                    emission_deficit=emission_deficit,
+                    world_id=self._world_id,
+                )
+            )
+
         return per_agent
 
     # ------------------------------------------------------------------
