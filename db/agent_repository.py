@@ -39,6 +39,7 @@ from sqlalchemy.types import JSON
 
 from engine.algocracy import ComplianceOutcome
 from models.agent_state import AgentState
+from orchestration.simulation_loop import TickMetrics
 
 
 class Base(DeclarativeBase):
@@ -88,6 +89,32 @@ class ComplianceDecisionRecord(Base):
     authenticity_before: Mapped[float] = mapped_column(Float, nullable=False)
     authenticity_after: Mapped[float] = mapped_column(Float, nullable=False)
     timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class TickMetricsRecord(Base):
+    """ORM row for one ``TickMetrics`` snapshot.
+
+    Composite primary key ``(world_id, tick)``: every world produces exactly
+    one row per tick. Persisting the prices and time-allocation as JSON
+    avoids hard-coding a schema while still giving exporters direct column
+    access for the most-queried scalars (burnout / authenticity / spectacle /
+    deficit). Used as the source of truth for the macro time series.
+    """
+
+    __tablename__ = "tick_metrics"
+
+    world_id: Mapped[str] = mapped_column(String(16), primary_key=True)
+    tick: Mapped[int] = mapped_column(Integer, primary_key=True)
+    timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    mean_authenticity_index: Mapped[float] = mapped_column(Float, nullable=False)
+    mean_spectacle_immersion: Mapped[float] = mapped_column(Float, nullable=False)
+    mean_cognitive_load: Mapped[float] = mapped_column(Float, nullable=False)
+    burnout_rate: Mapped[float] = mapped_column(Float, nullable=False)
+    automation_triggered: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    emission_deficit: Mapped[float] = mapped_column(Float, nullable=False)
+    prices: Mapped[dict] = mapped_column(JSON, nullable=False)
+    aggregate_time_allocation: Mapped[dict] = mapped_column(JSON, nullable=False)
+    extra: Mapped[dict] = mapped_column(JSON, nullable=False)
 
 
 class AgentStateRepository:
@@ -245,6 +272,51 @@ class AgentStateRepository:
             existing.authenticity_before = outcome.authenticity_before
             existing.authenticity_after = outcome.authenticity_after
             existing.timestamp = outcome.timestamp
+
+    # ------------------------------------------------------------------
+    # Tick metrics (macro time series)
+    # ------------------------------------------------------------------
+    def save_tick_metrics(self, metrics: TickMetrics) -> None:
+        """Upsert one ``TickMetrics`` row keyed on ``(world_id, tick)``.
+
+        Resumed runs may emit metrics for a tick that was previously written
+        if the runner is restarted at the same tick number; the upsert path
+        keeps the contract idempotent.
+        """
+        with self._transaction() as session:
+            stmt = select(TickMetricsRecord).where(
+                TickMetricsRecord.world_id == metrics.world_id,
+                TickMetricsRecord.tick == metrics.tick,
+            )
+            existing: Optional[TickMetricsRecord] = session.execute(
+                stmt
+            ).scalar_one_or_none()
+
+            payload = dict(
+                timestamp=metrics.timestamp,
+                mean_authenticity_index=metrics.mean_authenticity_index,
+                mean_spectacle_immersion=metrics.mean_spectacle_immersion,
+                mean_cognitive_load=metrics.mean_cognitive_load,
+                burnout_rate=metrics.burnout_rate,
+                automation_triggered=metrics.automation_triggered,
+                emission_deficit=metrics.emission_deficit,
+                prices=dict(metrics.prices),
+                aggregate_time_allocation=dict(metrics.aggregate_time_allocation),
+                extra=dict(metrics.extra),
+            )
+
+            if existing is None:
+                session.add(
+                    TickMetricsRecord(
+                        world_id=metrics.world_id,
+                        tick=metrics.tick,
+                        **payload,
+                    )
+                )
+                return
+
+            for k, v in payload.items():
+                setattr(existing, k, v)
 
     def list_compliance(
         self,

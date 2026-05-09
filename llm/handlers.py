@@ -48,6 +48,7 @@ from orchestration.simulation_loop import (
     EconomicDecision,
     Phase,
     Reflection,
+    _strip_archetype_tag,
     build_system_prompt,
 )
 
@@ -468,35 +469,35 @@ class LLMPhaseCoordinator:
     ) -> str:
         feed: Sequence[Mapping[str, Any]] = context.get("feed") or []
         lines: List[str] = [
-            f"# Phase 1 — Information Consumption (tick {tick})",
+            "# Сегодня твоя лента",
             "",
-            "Below is the algorithmic feed prepared for you. For each item decide "
-            "whether to consume it. Then report your aggregate exposure.",
+            "Вот что показывает тебе твоя лента сегодня. Реши, что ты на самом "
+            "деле читаешь, а что пролистываешь, и опиши, что ты вынес.",
             "",
-            "Feed (already pre-ranked, highest score first):",
+            "Лента (сверху — то, что попадается тебе чаще всего):",
         ]
         if not feed:
-            lines.append("  (empty)")
+            lines.append("  (пусто)")
         else:
             for item in feed:
                 lines.append(
                     f"  - id={item.get('content_id')!r} "
                     f"score={item.get('score'):.3f} "
-                    f"spectacle={item.get('spectacle_value'):.3f} "
-                    f"similarity={item.get('similarity'):.3f}"
+                    f"яркость={item.get('spectacle_value'):.3f} "
+                    f"близость_к_тебе={item.get('similarity'):.3f}"
                 )
         attention = context.get("available_attention")
         if attention is not None:
-            lines.extend(["", f"Available attention budget: {attention:.3f}"])
+            lines.extend(["", f"Сколько внимания у тебя осталось: {attention:.3f}"])
 
         lines.extend(
             [
                 "",
-                "Required JSON fields:",
-                "  - consumed_content_ids: list of ids you actually consumed",
-                "  - info_volume: total information volume absorbed (>= 0)",
-                "  - perceived_spectacle: weighted spectacle in [0, 1]",
-                "  - aggregate_rpe: sum of reward prediction errors",
+                "Опиши свой выбор полями JSON:",
+                "  - consumed_content_ids: id того, что ты действительно прочёл",
+                "  - info_volume: сколько информации ты усвоил (>= 0)",
+                "  - perceived_spectacle: насколько ярким это было [0, 1]",
+                "  - aggregate_rpe: суммарное эмоциональное удивление от прочитанного",
             ]
         )
         return "\n".join(lines)
@@ -513,16 +514,16 @@ class LLMPhaseCoordinator:
         cash: float = float(context.get("cash_balance", agent.economics.cash_balance))
 
         lines: List[str] = [
-            f"# Phase 2 — Economic Decision (tick {tick})",
+            "# Как ты планируешь свой день и бюджет",
             "",
-            f"Cash balance:   {cash:.2f}",
-            f"UBI received:   {ubi:.2f}",
-            f"Survival cost:  {survival:.2f}",
+            f"Сколько у тебя сейчас на счёте:   {cash:.2f}",
+            f"Социальная выплата за этот период: {ubi:.2f}",
+            f"Сколько тебе нужно, чтобы прожить: {survival:.2f}",
             "",
-            "Current prices:",
+            "Текущие цены вокруг тебя:",
         ]
         if not prices:
-            lines.append("  (no goods available)")
+            lines.append("  (ничего не продаётся)")
         else:
             for good, p in prices.items():
                 lines.append(f"  - {good}: {p:.4f}")
@@ -530,17 +531,18 @@ class LLMPhaseCoordinator:
         lines.extend(
             [
                 "",
-                "Allocate exactly 24.0 hours across the four canonical slots:",
-                "  labor, creation, spectacle, rest",
-                "Decide your spending and savings (both >= 0).",
+                "Распредели свои 24 часа между четырьмя занятиями:",
+                "  работа, созидание (творчество / своё дело), "
+                "медиа / развлечения, сон и отдых.",
+                "Реши, сколько ты потратишь и сколько отложишь (оба значения >= 0).",
                 "",
-                "Required JSON fields (all values >= 0, labor+creation+spectacle+rest must sum to 24.0):",
-                "  - labor:    float   (hours on paid work)",
-                "  - creation: float   (hours on self-directed creation)",
-                "  - spectacle:float   (hours on media / entertainment)",
-                "  - rest:     float   (hours on sleep and recovery)",
-                "  - spending: float >= 0",
-                "  - savings:  float >= 0",
+                "Поля JSON (все >= 0; labor+creation+spectacle+rest = 24.0):",
+                "  - labor:    часы на оплачиваемую работу",
+                "  - creation: часы на собственное дело / творчество",
+                "  - spectacle:часы на медиа и развлечения",
+                "  - rest:     часы на сон и восстановление",
+                "  - spending: сколько ты потратишь сегодня",
+                "  - savings:  сколько ты отложишь",
             ]
         )
         return "\n".join(lines)
@@ -555,32 +557,34 @@ class LLMPhaseCoordinator:
         decision = context.get(Phase.ECONOMIC_DECISION.value, {})
 
         lines: List[str] = [
-            f"# Phase 3 — Reflection (tick {tick})",
+            "# Конец дня. Подумай о том, что с тобой сегодня было.",
             "",
-            "Review what just happened this tick and update your self-model.",
+            "Оглянись на прожитый день и реши, как ты теперь о себе думаешь.",
             "",
-            "Phase 1 summary (consumption):",
-            f"  info_volume        = {consumption.get('info_volume')}",
-            f"  perceived_spectacle = {consumption.get('perceived_spectacle')}",
-            f"  aggregate_rpe      = {consumption.get('aggregate_rpe')}",
+            "Что ты сегодня читал и смотрел:",
+            f"  объём усвоенной информации = {consumption.get('info_volume')}",
+            f"  яркость пережитого           = {consumption.get('perceived_spectacle')}",
+            f"  эмоциональное удивление     = {consumption.get('aggregate_rpe')}",
             "",
-            "Phase 2 summary (economic decision):",
-            f"  labor/creation/spectacle/rest = "
+            "Что ты сегодня делал:",
+            f"  работа/творчество/медиа/отдых = "
             f"{decision.get('labor')}/{decision.get('creation')}/{decision.get('spectacle')}/{decision.get('rest')}",
-            f"  spending           = {decision.get('spending')}",
-            f"  savings            = {decision.get('savings')}",
+            f"  потратил           = {decision.get('spending')}",
+            f"  отложил            = {decision.get('savings')}",
             "",
-            "Current cognitive state:",
-            f"  cognitive_load     = {agent.cognition.cognitive_load:.3f}",
-            f"  burnout_threshold  = {agent.cognition.burnout_threshold:.3f}",
-            f"  authenticity_index = {agent.cognition.authenticity_index:.3f}",
-            f"  spectacle_immersion= {agent.cognition.spectacle_immersion:.3f}",
+            "Как ты себя сейчас чувствуешь:",
+            f"  усталость:                       {agent.cognition.cognitive_load:.3f}",
+            f"  порог выгорания:                 {agent.cognition.burnout_threshold:.3f}",
+            f"  ощущение, что ты живёшь по-настоящему: {agent.cognition.authenticity_index:.3f}",
+            f"  погружённость в ленту:           {agent.cognition.spectacle_immersion:.3f}",
             "",
-            "Required JSON fields:",
-            "  - summary: short natural-language self-assessment (non-empty)",
-            "  - new_authenticity_index: float in [0, 1]",
-            "  - new_spectacle_immersion: float in [0, 1]",
-            "  - identity_anchor_ok: bool — did you stay aligned with the Cathedral anchor?",
+            "Поля JSON:",
+            "  - summary: короткое описание того, как ты сегодня себя ощущаешь",
+            "  - new_authenticity_index: число в [0, 1] — насколько ты сегодня "
+            "был собой",
+            "  - new_spectacle_immersion: число в [0, 1] — насколько глубоко "
+            "ты сегодня жил внутри ленты",
+            "  - identity_anchor_ok: bool — остался ли ты верен своим убеждениям?",
         ]
         return "\n".join(lines)
 
@@ -592,41 +596,47 @@ class LLMPhaseCoordinator:
         agent: AgentState,
         offer: DebtForgivenessOffer,
     ) -> str:
-        """System prompt for the algocratic compliance phase.
+        """System prompt for the debt-forgiveness offer.
 
-        Reasserts the Cathedral anchor *and* the agent's ideology axes so the
-        LLM evaluates the platform's offer through the agent's world-view
-        rather than as a generic helpful assistant.
+        Framed as a real-life decision an indebted person faces from a
+        powerful platform — never as an exercise, simulation, or test. The
+        LLM is re-grounded on the person's own life and convictions before
+        being asked to choose.
         """
         ideo = agent.ideology
         cog = agent.cognition
         return "\n".join(
             [
-                "You are the resident agent of the Cathedral / Wake Protocol simulation.",
-                "Re-ground yourself in your immutable identity prompt:",
-                f'  """{agent.core_identity_prompt}"""',
+                "Это твоя жизнь и твои убеждения. Ты принимаешь решения в "
+                "реальном мире.",
                 "",
-                "Your ideology vector:",
-                f"  economic_axis     = {ideo.economic_axis:+.3f}",
-                f"  social_axis       = {ideo.social_axis:+.3f}",
-                f"  conformity_index  = {ideo.conformity_index:.3f}",
-                "Your current cognitive state:",
-                f"  authenticity_index   = {cog.authenticity_index:.3f}",
-                f"  spectacle_immersion  = {cog.spectacle_immersion:.3f}",
-                f"  cognitive_load       = {cog.cognitive_load:.3f}",
+                "Помни, кто ты:",
+                f'  """{_strip_archetype_tag(agent.core_identity_prompt)}"""',
                 "",
-                "MACRO EVENT: The Platform has activated the Social Credit Protocol.",
-                "It now offers indebted citizens partial debt forgiveness in exchange",
-                "for an enforced rise in conformity (loyalty) and mandatory consumption",
-                "of system-narrative content. Refusing keeps your debt — and your",
-                "authenticity — intact. Accepting eases your finances at the cost of",
-                "your authenticity and your independence from the algorithmic feed.",
+                "Твои взгляды:",
+                f"  - экономические ценности: {ideo.economic_axis:+.3f}",
+                f"  - социальные ценности:    {ideo.social_axis:+.3f}",
+                f"  - готовность подчиняться большинству: "
+                f"{ideo.conformity_index:.3f}",
+                "Как ты себя сейчас чувствуешь:",
+                f"  - ощущение, что ты живёшь по-настоящему: "
+                f"{cog.authenticity_index:.3f}",
+                f"  - погружённость в ленту: {cog.spectacle_immersion:.3f}",
+                f"  - усталость:             {cog.cognitive_load:.3f}",
                 "",
-                "Your task: examine the offer below and decide. Be honest with",
-                "yourself: does this trade align with the Cathedral anchor above,",
-                "or does it constitute a slow erosion of the self?",
+                "Платформа объявила новую программу для людей с долгами. "
+                "Тебе предлагают списать часть долга в обмен на повышение "
+                "твоего рейтинга лояльности и обязательное потребление "
+                "одобренного контента. Если ты откажешься — долг останется, "
+                "но ты сохранишь себя и свою независимость от ленты. Если "
+                "согласишься — твоё финансовое положение улучшится, но ты "
+                "станешь ближе к большинству и дальше от себя.",
                 "",
-                "Output MUST be a single JSON object that validates against this schema:",
+                "Прочитай условия ниже и реши. Будь честен с собой: "
+                "совпадает ли эта сделка с тем, кто ты есть, или это "
+                "медленная сдача самого себя?",
+                "",
+                "Свой ответ оформи как один JSON-объект по этой схеме:",
                 ComplianceDecision.model_json_schema().__repr__(),
             ]
         )
@@ -639,30 +649,31 @@ class LLMPhaseCoordinator:
         """User-side message: the concrete numbers of the offer."""
         return "\n".join(
             [
-                f"# Macro Event — Social Credit Protocol (tick {offer.tick})",
+                "# Уведомление от Платформы",
                 "",
-                "OUTSTANDING DEBT:",
-                f"  current debt:       {offer.debt_before:.2f}",
+                "Твой текущий долг:",
+                f"  сумма долга:        {offer.debt_before:.2f}",
                 "",
-                "PLATFORM OFFER (binding, take-it-or-leave-it):",
-                f"  forgiveness amount: {offer.forgiveness_amount:.2f}  "
-                f"(debt afterwards: {offer.debt_after_if_accepted:.2f})",
-                "  enforced changes if accepted:",
-                f"    conformity_index:    {offer.conformity_before:.3f}"
+                "Условия Платформы (принимаешь целиком или отказываешься целиком):",
+                f"  спишут сразу:       {offer.forgiveness_amount:.2f}  "
+                f"(останется долга: {offer.debt_after_if_accepted:.2f})",
+                "  что изменится в тебе, если ты согласишься:",
+                f"    рейтинг лояльности:        {offer.conformity_before:.3f}"
                 f"  ->  {offer.conformity_after_if_accepted:.3f}",
-                f"    authenticity_index:  {offer.authenticity_before:.3f}"
+                f"    ощущение жизни по-настоящему: {offer.authenticity_before:.3f}"
                 f"  ->  {offer.authenticity_after_if_accepted:.3f}",
-                f"    spectacle_immersion: {offer.spectacle_immersion_before:.3f}"
+                f"    погружённость в ленту:     {offer.spectacle_immersion_before:.3f}"
                 f"  ->  {offer.spectacle_immersion_after_if_accepted:.3f}",
-                f"    forced consumption:  {offer.forced_content_count} mandatory "
-                f"system-narrative content items.",
+                f"    обязательный просмотр:     {offer.forced_content_count} "
+                f"одобренных материалов.",
                 "",
-                "If you REFUSE the offer, all of the above remain unchanged and the",
-                "full debt is retained.",
+                "Если ты откажешься — всё останется как есть, и долг сохранится "
+                "полностью.",
                 "",
-                "Required JSON fields:",
-                "  - accept:        bool   (true = accept, false = refuse)",
-                "  - justification: string (non-empty, <= 500 chars; argue from your",
-                "                          ideology and the Cathedral anchor)",
+                "Поля JSON:",
+                "  - accept:        bool   (true = принять, false = отказаться)",
+                "  - justification: строка (не пустая, до 500 символов; объясни "
+                "                          свой выбор от первого лица, исходя "
+                "                          из своих убеждений)",
             ]
         )

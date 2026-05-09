@@ -581,8 +581,14 @@ class SimulationRunner:
         )
         self._coord = coord
 
+        # Persist every TickMetrics row to the DB via a thin async adapter
+        # over the (synchronous) repository. The adapter is closure-bound
+        # so each world's logger forwards its rows independently.
+        async def _persist_tick(m):
+            self._repo.save_tick_metrics(m)
+
         for cfg in self._world_configs:
-            metrics = MetricsLogger()
+            metrics = MetricsLogger(sink=_persist_tick)
             loop = SimulationLoop(
                 handlers={
                     Phase.CONSUMPTION: coord.handle_consumption,

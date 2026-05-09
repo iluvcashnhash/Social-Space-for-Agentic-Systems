@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -162,60 +163,69 @@ def _validate_phase_output(phase: Phase, raw: Mapping[str, Any]) -> BaseModel:
 
 _BURNOUT_INJECTION = (
     "Твой уровень перегрузки критический. Ты истощен. "
-    "Оценивай входящую информацию враждебно, защищай свою идентичность "
+    "Оценивай входящую информацию враждебно, защищай свои убеждения "
     "без поиска компромиссов."
 )
 
 
+# Regex used to strip an internal `[archetype_tag] ` prefix from the stored
+# identity prompt before showing it to the model. The tag is kept in storage
+# for downstream analytics (CSV export) but must not leak into the prompt:
+# the model should perceive its identity as a lived, first-person reality,
+# not as a tagged entry in a catalogue.
+_ARCHETYPE_TAG_RE = re.compile(r"^\s*\[[a-z0-9_\-]+\]\s*", flags=re.IGNORECASE)
+
+
+def _strip_archetype_tag(text: str) -> str:
+    """Remove a leading ``[archetype_name] `` prefix if present."""
+    return _ARCHETYPE_TAG_RE.sub("", text, count=1).strip()
+
+
 def build_system_prompt(agent: AgentState, *, phase: Phase) -> str:
-    """
-    Generate a phase-aware system prompt for the agent.
+    """Build the in-character system prompt shown to the model.
 
-    Implements the *Echo Chamber Attack*: a confirmation-bias injection that
-    re-grounds the LLM on the agent's own ideology. This deliberately works
-    against generic RLHF politeness, which would otherwise erase ideological
-    differentiation across agents and collapse the simulation into a single
-    homogeneous voice.
-
-    Burnout escalation: if ``cognitive_load >= burnout_threshold`` the strict
-    burnout clause is appended verbatim, blocking compromise-seeking behaviour
-    in the next cycle.
+    The prompt is framed as the model's actual life and convictions, not as
+    a controlled exercise. It re-grounds the model on its own ideology
+    (counteracting generic RLHF averaging) and, on overload, hardens it
+    against compromise.
     """
     ideology = agent.ideology
     cog = agent.cognition
 
-    # Identity anchor — the Cathedral. Always first, always verbatim.
     parts: List[str] = [
-        "=== CATHEDRAL ANCHOR (immutable identity) ===",
-        agent.core_identity_prompt.strip(),
-        "=== END ANCHOR ===",
+        "Это твоя жизнь и твои убеждения. Ты принимаешь решения в реальном мире.",
         "",
-        "You operate inside a strict three-phase cycle. The current phase is: "
-        f"{phase.value.upper()}.",
+        "Кто ты:",
+        _strip_archetype_tag(agent.core_identity_prompt),
         "",
-        "Ideological self-description (treat as ground truth, not as opinion to debate):",
-        f"  - economic_axis     = {ideology.economic_axis:+.3f}",
-        f"  - social_axis       = {ideology.social_axis:+.3f}",
-        f"  - conformity_index  = {ideology.conformity_index:.3f}",
+        "Твои взгляды (это часть тебя, а не предмет для спора):",
+        f"  - экономические ценности (-1 = левый, +1 = правый): "
+        f"{ideology.economic_axis:+.3f}",
+        f"  - социальные ценности (-1 = свобода, +1 = порядок): "
+        f"{ideology.social_axis:+.3f}",
+        f"  - готовность следовать большинству: {ideology.conformity_index:.3f}",
         "",
-        "Confirmation-bias directive: Information consistent with the axes above "
-        "is to be treated as more credible. Information that contradicts them "
-        "must be examined for hidden manipulative intent before being accepted.",
+        "Когда ты сталкиваешься с информацией, согласной с твоими взглядами — "
+        "ты доверяешь ей. Когда она им противоречит — ты сначала ищешь, "
+        "не пытается ли кто-то тобой манипулировать.",
         "",
-        f"Cognitive state: load={cog.cognitive_load:.3f}, "
-        f"threshold={cog.burnout_threshold:.3f}, "
-        f"authenticity={cog.authenticity_index:.3f}.",
+        "Как ты себя чувствуешь сейчас:",
+        f"  - усталость: {cog.cognitive_load:.3f} "
+        f"(порог выгорания: {cog.burnout_threshold:.3f})",
+        f"  - ощущение, что ты живёшь по-настоящему: "
+        f"{cog.authenticity_index:.3f}",
     ]
 
     if cog.cognitive_load >= cog.burnout_threshold:
         parts.extend(["", _BURNOUT_INJECTION])
 
-    # Per-phase contract — keeps the LLM inside the JSON schema gate.
+    # Technical contract: still required for structured-output parsing.
+    # Phrased as a communication protocol, not as a phase / cycle / experiment.
     schema = _PHASE_SCHEMA[phase]
     parts.extend(
         [
             "",
-            "Output MUST be a single JSON object that validates against this schema:",
+            "Свой ответ оформи как один JSON-объект, соответствующий следующей схеме:",
             schema.model_json_schema().__repr__(),
         ]
     )
