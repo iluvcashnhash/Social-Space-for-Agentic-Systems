@@ -34,6 +34,14 @@ import json
 import logging
 import os
 import signal
+
+# Load .env before any os.environ reads (no-op if python-dotenv is absent).
+try:
+    from dotenv import load_dotenv
+    load_dotenv(override=False)
+except ImportError:
+    pass
+
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 from uuid import UUID
@@ -517,14 +525,26 @@ def _install_signal_handlers(runner: SimulationRunner) -> None:
 
 def _build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Run the Cathedral / Wake Protocol ABM.")
-    p.add_argument("--ticks", type=int, default=20, help="Maximum simulation ticks")
-    p.add_argument("--n", type=int, default=50, help="Initial population size on first run")
-    p.add_argument("--seed", type=int, default=42, help="RNG seed for bootstrap")
+    p.add_argument(
+        "--ticks", type=int,
+        default=int(os.environ.get("CATHEDRAL_MAX_TICKS", 20)),
+        help="Maximum simulation ticks (env: CATHEDRAL_MAX_TICKS)",
+    )
+    p.add_argument(
+        "--n", type=int,
+        default=int(os.environ.get("CATHEDRAL_N_AGENTS", 50)),
+        help="Initial population size on first run (env: CATHEDRAL_N_AGENTS)",
+    )
+    p.add_argument(
+        "--seed", type=int,
+        default=int(os.environ.get("CATHEDRAL_SEED", 42)),
+        help="RNG seed for bootstrap (env: CATHEDRAL_SEED)",
+    )
     p.add_argument(
         "--db",
         type=str,
         default=os.environ.get("DATABASE_URL", ""),
-        help="SQLAlchemy URL (defaults to $DATABASE_URL)",
+        help="SQLAlchemy URL (env: DATABASE_URL)",
     )
     p.add_argument("-v", "--verbose", action="store_true")
     return p

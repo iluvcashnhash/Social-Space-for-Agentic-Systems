@@ -24,8 +24,7 @@ from contextlib import contextmanager
 from typing import Iterator, Optional
 from uuid import UUID
 
-from sqlalchemy import Integer, String, select
-from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
+from sqlalchemy import Integer, String, Text, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import NoResultFound
 from sqlalchemy.orm import (
@@ -35,6 +34,7 @@ from sqlalchemy.orm import (
     mapped_column,
     sessionmaker,
 )
+from sqlalchemy.types import JSON
 
 from models.agent_state import AgentState
 
@@ -48,10 +48,10 @@ class AgentStateRecord(Base):
 
     __tablename__ = "agent_states"
 
-    agent_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True)
-    core_identity_prompt: Mapped[str] = mapped_column(String, nullable=False)
+    agent_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    core_identity_prompt: Mapped[str] = mapped_column(Text, nullable=False)
     tick: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    payload: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    payload: Mapped[dict] = mapped_column(JSON, nullable=False)
 
 
 class AgentStateRepository:
@@ -91,19 +91,23 @@ class AgentStateRepository:
         if anything fails, the row is left unchanged.
         """
         payload = state.model_dump(mode="json")
+        agent_id_str = str(state.agent_id)
 
         with self._transaction() as session:
-            stmt = (
-                select(AgentStateRecord)
-                .where(AgentStateRecord.agent_id == state.agent_id)
-                .with_for_update()
+            # FOR UPDATE is a no-op on SQLite (not supported); on PostgreSQL it
+            # provides a pessimistic row lock to prevent concurrent write races.
+            is_pg = session.bind.dialect.name == "postgresql"  # type: ignore[union-attr]
+            stmt = select(AgentStateRecord).where(
+                AgentStateRecord.agent_id == agent_id_str
             )
+            if is_pg:
+                stmt = stmt.with_for_update()
             existing: Optional[AgentStateRecord] = session.execute(stmt).scalar_one_or_none()
 
             if existing is None:
                 session.add(
                     AgentStateRecord(
-                        agent_id=state.agent_id,
+                        agent_id=agent_id_str,
                         core_identity_prompt=state.core_identity_prompt,
                         tick=state.tick,
                         payload=payload,
@@ -125,13 +129,15 @@ class AgentStateRepository:
         """Return every persisted agent, re-validated through the Pydantic schema."""
         with self._transaction() as session:
             rows = session.execute(select(AgentStateRecord)).scalars().all()
-            return [AgentState.model_validate(r.payload) for r in rows]
+            return [AgentState.model_validate(r.payload) for r in rows]  # type: ignore[arg-type]
 
     def load(self, agent_id: UUID) -> AgentState:
         """Load and re-validate an agent state from the database."""
         with self._transaction() as session:
-            stmt = select(AgentStateRecord).where(AgentStateRecord.agent_id == agent_id)
+            stmt = select(AgentStateRecord).where(
+                AgentStateRecord.agent_id == str(agent_id)
+            )
             row = session.execute(stmt).scalar_one_or_none()
             if row is None:
                 raise NoResultFound(f"No AgentState for agent_id={agent_id}")
-            return AgentState.model_validate(row.payload)
+            return AgentState.model_validate(row.payload)  # type: ignore[arg-type]
