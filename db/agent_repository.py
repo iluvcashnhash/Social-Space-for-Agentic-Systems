@@ -22,10 +22,10 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from datetime import datetime
-from typing import Iterator, List, Optional
+from typing import Iterator, List, Optional, Sequence
 from uuid import UUID
 
-from sqlalchemy import Boolean, DateTime, Float, Integer, String, Text, select
+from sqlalchemy import Boolean, DateTime, Float, Integer, String, Text, select, tuple_
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import NoResultFound
 from sqlalchemy.orm import (
@@ -190,6 +190,65 @@ class AgentStateRepository:
 
             existing.tick = state.tick
             existing.payload = payload
+
+    def save_many(self, states: Sequence[AgentState]) -> None:
+        """
+        Bulk upsert multiple agent states in a single transaction.
+
+        Uses batch SELECT to find existing rows, then performs inserts or updates
+        as needed. Identity drift protection (core_identity_prompt check) is
+        enforced for all updates.
+
+        This method is significantly faster than calling save() N times because
+        it uses a single database round-trip and transaction.
+        """
+        if not states:
+            return
+
+        with self._transaction() as session:
+            is_pg = session.bind.dialect.name == "postgresql"  # type: ignore[union-attr]
+
+            # Collect all (agent_id, world_id) keys for batch SELECT
+            keys = [(str(s.agent_id), s.world_id) for s in states]
+
+            # Batch query to find existing rows
+            stmt = select(AgentStateRecord).where(
+                tuple_(AgentStateRecord.agent_id, AgentStateRecord.world_id).in_(keys)
+            )
+            if is_pg:
+                stmt = stmt.with_for_update()
+
+            existing_rows = {
+                (r.agent_id, r.world_id): r
+                for r in session.execute(stmt).scalars().all()
+            }
+
+            # Process each state: insert or update
+            for state in states:
+                payload = state.model_dump(mode="json")
+                key = (str(state.agent_id), state.world_id)
+
+                if key in existing_rows:
+                    row = existing_rows[key]
+                    # Identity invariant: refuse to mutate the Cathedral anchor
+                    if row.core_identity_prompt != state.core_identity_prompt:
+                        raise ValueError(
+                            f"Refusing to overwrite core_identity_prompt for agent "
+                            f"{state.agent_id} in world {state.world_id!r}: "
+                            f"identity drift detected."
+                        )
+                    row.tick = state.tick
+                    row.payload = payload
+                else:
+                    session.add(
+                        AgentStateRecord(
+                            agent_id=str(state.agent_id),
+                            world_id=state.world_id,
+                            core_identity_prompt=state.core_identity_prompt,
+                            tick=state.tick,
+                            payload=payload,
+                        )
+                    )
 
     def list_all(self, world_id: Optional[str] = None) -> list[AgentState]:
         """Return persisted agents (optionally filtered by ``world_id``).

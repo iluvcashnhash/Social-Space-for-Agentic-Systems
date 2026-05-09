@@ -585,7 +585,8 @@ class SimulationRunner:
         # over the (synchronous) repository. The adapter is closure-bound
         # so each world's logger forwards its rows independently.
         async def _persist_tick(m):
-            self._repo.save_tick_metrics(m)
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, self._repo.save_tick_metrics, m)
 
         for cfg in self._world_configs:
             metrics = MetricsLogger(sink=_persist_tick)
@@ -664,8 +665,9 @@ class SimulationRunner:
             contexts=contexts,
         )
 
-        # E. Apply phase outputs and persist (each save uses world_id from agent).
+        # E. Apply phase outputs and collect updates for bulk persistence.
         total_spending = 0.0
+        updated_agents: list[AgentState] = []
         for a in agents:
             results = per_agent.get(a.agent_id)
             if results is None:
@@ -680,8 +682,13 @@ class SimulationRunner:
                     cfg.world_id, a.agent_id,
                 )
                 continue
-            self._repo.save(updated)
+            updated_agents.append(updated)
             total_spending += spending
+
+        # Bulk save all updated agents in a single non-blocking DB transaction.
+        if updated_agents:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, self._repo.save_many, updated_agents)
 
         state.last_transaction_volume = total_spending
         state.last_aggregate_labor_hours = _aggregate_labor(agents)
